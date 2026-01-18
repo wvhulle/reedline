@@ -4,7 +4,7 @@ use itertools::Itertools;
 use nu_ansi_term::{Color, Style};
 
 #[cfg(feature = "lsp_diagnostics")]
-use crate::lsp::LspDiagnosticsProvider;
+use crate::lsp::{Diagnostic, LspDiagnosticsProvider};
 use crate::{enums::ReedlineRawEvent, CursorConfig};
 #[cfg(feature = "bashisms")]
 use crate::{
@@ -1453,8 +1453,11 @@ impl Reedline {
 
             #[cfg(feature = "lsp_diagnostics")]
             ReedlineEvent::OpenDiagnosticFixMenu => {
-                self.open_diagnostic_fix_menu();
-                Ok(EventStatus::Handled)
+                if self.open_diagnostic_fix_menu() {
+                    Ok(EventStatus::Handled)
+                } else {
+                    Ok(EventStatus::Inapplicable)
+                }
             }
             ReedlineEvent::None => Ok(EventStatus::Inapplicable),
         }
@@ -2189,7 +2192,11 @@ impl Reedline {
         let mut output = String::new();
         for (i, (start_col, end_col, diag)) in diag_cols.iter().enumerate() {
             // Columns that need vertical lines (diagnostics after this one)
-            let future_cols: Vec<usize> = diag_cols[i + 1..].iter().map(|(c, _, _)| *c).collect();
+            // Include the diagnostic reference to style vertical bars with matching severity
+            let future_diags: Vec<(usize, &Diagnostic)> = diag_cols[i + 1..]
+                .iter()
+                .map(|(c, _, d)| (*c, *d))
+                .collect();
 
             let styled_message = if self.use_ansi_coloring {
                 diag.severity
@@ -2209,14 +2216,20 @@ impl Reedline {
             let mut col = 0;
 
             // Add vertical lines for future diagnostics that come before this one's column
-            for &future_col in &future_cols {
-                if future_col < *start_col {
+            for (future_col, future_diag) in &future_diags {
+                if *future_col < *start_col {
                     // Add spaces up to this column, then a vertical bar
-                    while col < future_col {
+                    while col < *future_col {
                         line.push(' ');
                         col += 1;
                     }
-                    line.push('╎');
+                    if self.use_ansi_coloring {
+                        line.push_str(
+                            &future_diag.severity.message_style().paint("╎").to_string(),
+                        );
+                    } else {
+                        line.push('╎');
+                    }
                     col += 1;
                 }
             }
@@ -2231,16 +2244,32 @@ impl Reedline {
             let span_width = end_col.saturating_sub(*start_col);
 
             // Add the corner, optional horizontal extension, and message
+            // Style connectors with the diagnostic's severity color
             if span_width <= 1 {
                 // Single character span: just corner
-                line.push_str("╰ ");
+                if self.use_ansi_coloring {
+                    line.push_str(&diag.severity.message_style().paint("╰").to_string());
+                    line.push(' ');
+                } else {
+                    line.push_str("╰ ");
+                }
             } else {
                 // Multi-character span: corner + horizontal line + end terminator
-                line.push('╰');
-                for _ in 0..span_width.saturating_sub(2) {
-                    line.push('─');
+                if self.use_ansi_coloring {
+                    let style = diag.severity.message_style();
+                    line.push_str(&style.paint("╰").to_string());
+                    for _ in 0..span_width.saturating_sub(2) {
+                        line.push_str(&style.paint("─").to_string());
+                    }
+                    line.push_str(&style.paint("╯").to_string());
+                    line.push(' ');
+                } else {
+                    line.push('╰');
+                    for _ in 0..span_width.saturating_sub(2) {
+                        line.push('─');
+                    }
+                    line.push_str("╯ ");
                 }
-                line.push_str("╯ ");
             }
             line.push_str(&styled_message);
 
@@ -2253,13 +2282,15 @@ impl Reedline {
     ///
     /// This requests code actions from the LSP server for diagnostics at the
     /// cursor position and displays them in a menu.
+    ///
+    /// Returns `true` if the menu was opened, `false` if there were no fixes.
     #[cfg(feature = "lsp_diagnostics")]
-    fn open_diagnostic_fix_menu(&mut self) {
+    fn open_diagnostic_fix_menu(&mut self) -> bool {
         use crate::lsp::Span;
         use crate::menu::{DiagnosticFixMenu, FixOption};
 
         let Some(ref mut provider) = self.lsp_diagnostics else {
-            return;
+            return false;
         };
 
         let cursor_pos = self.editor.insertion_point();
@@ -2284,7 +2315,7 @@ impl Reedline {
         let code_actions = provider.code_actions(content, span);
 
         if code_actions.is_empty() {
-            return;
+            return false;
         }
 
         // Convert code actions to fix options
@@ -2303,6 +2334,7 @@ impl Reedline {
         let mut menu = ReedlineMenu::EngineCompleter(Box::new(fix_menu));
         menu.menu_event(MenuEvent::Activate(false));
         self.menus.push(menu);
+        true
     }
 
     #[cfg(feature = "external_printer")]
