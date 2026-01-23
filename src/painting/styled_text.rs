@@ -29,8 +29,18 @@ impl StyledText {
         self.buffer.push(styled_string);
     }
 
-    /// Style range with the provided style
+    /// Style range with the provided style (replaces existing style)
     pub fn style_range(&mut self, from: usize, to: usize, new_style: Style) {
+        self.transform_style_range(from, to, |_| new_style);
+    }
+
+    /// Transform styles in a range using the provided function.
+    /// Unlike `style_range` which replaces styles, this preserves and modifies existing styles.
+    /// Useful for adding attributes (like underline) while preserving colors.
+    pub fn transform_style_range<F>(&mut self, from: usize, to: usize, f: F)
+    where
+        F: Fn(Style) -> Style,
+    {
         let (from, to) = if from > to { (to, from) } else { (from, to) };
         let mut current_idx = 0;
         let mut pair_idx = 0;
@@ -60,7 +70,7 @@ impl StyledText {
                 (Position::Before, Position::After) => {
                     let mut in_range = pair.1.split_off(from - current_idx);
                     let after_range = in_range.split_off(to - from);
-                    let in_range = (new_style, in_range);
+                    let in_range = (f(pair.0), in_range);
                     let after_range = (pair.0, after_range);
                     self.buffer.insert(pair_idx + 1, in_range);
                     self.buffer.insert(pair_idx + 2, after_range);
@@ -68,19 +78,20 @@ impl StyledText {
                 }
                 (Position::Before, Position::In) => {
                     let in_range = pair.1.split_off(from - current_idx);
-                    pair_idx += 1; // Additional increment for the split pair, since the new insertion is already correctly styled and can be skipped next iteration
-                    self.buffer.insert(pair_idx, (new_style, in_range));
+                    let transformed_style = f(pair.0);
+                    pair_idx += 1;
+                    self.buffer.insert(pair_idx, (transformed_style, in_range));
                 }
                 (Position::In, Position::After) => {
                     let after_range = pair.1.split_off(to - current_idx);
                     let old_style = pair.0;
-                    pair.0 = new_style;
+                    pair.0 = f(old_style);
                     if !after_range.is_empty() {
                         self.buffer.insert(pair_idx + 1, (old_style, after_range));
                     }
                     break;
                 }
-                (Position::In, Position::In) => pair.0 = new_style,
+                (Position::In, Position::In) => pair.0 = f(pair.0),
 
                 (Position::After, _) => break,
                 _ => (),

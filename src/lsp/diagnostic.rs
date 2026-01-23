@@ -8,14 +8,6 @@ use nu_ansi_term::{Color, Style};
 // Re-export LSP types for public use
 pub use lsp_types::{CodeAction, Diagnostic, DiagnosticSeverity, Range, TextEdit};
 
-/// Get a style for underlining diagnostic spans in the source code.
-///
-/// Uses underline only (no text color change) to keep the source
-/// code readable while still indicating the diagnostic location.
-pub fn underline_style(_severity: DiagnosticSeverity) -> Style {
-    Style::new().underline()
-}
-
 /// Get a dimmed style for diagnostic messages displayed below the prompt.
 ///
 /// Uses muted colors to be less visually intrusive while still indicating severity.
@@ -260,8 +252,14 @@ mod tests {
     fn diagnostic_covers_single_char_variable() {
         let code = "let x = 1";
         let range = Range {
-            start: Position { line: 0, character: 4 },
-            end: Position { line: 0, character: 5 },
+            start: Position {
+                line: 0,
+                character: 4,
+            },
+            end: Position {
+                line: 0,
+                character: 5,
+            },
         };
         let span = range_to_span(code, &range);
         assert_eq!(&code[span.start..span.end], "x");
@@ -271,8 +269,14 @@ mod tests {
     fn diagnostic_covers_multi_char_identifier() {
         let code = "let foo = bar";
         let range = Range {
-            start: Position { line: 0, character: 4 },
-            end: Position { line: 0, character: 7 },
+            start: Position {
+                line: 0,
+                character: 4,
+            },
+            end: Position {
+                line: 0,
+                character: 7,
+            },
         };
         let span = range_to_span(code, &range);
         assert_eq!(&code[span.start..span.end], "foo");
@@ -282,8 +286,14 @@ mod tests {
     fn diagnostic_on_second_line() {
         let code = "let x = 1\nlet y = 2";
         let range = Range {
-            start: Position { line: 1, character: 4 },
-            end: Position { line: 1, character: 5 },
+            start: Position {
+                line: 1,
+                character: 4,
+            },
+            end: Position {
+                line: 1,
+                character: 5,
+            },
         };
         let span = range_to_span(code, &range);
         assert_eq!(&code[span.start..span.end], "y");
@@ -295,8 +305,14 @@ mod tests {
     fn cursor_inside_diagnostic_is_detected() {
         let code = "let foo = 1";
         let range = Range {
-            start: Position { line: 0, character: 4 },
-            end: Position { line: 0, character: 7 },
+            start: Position {
+                line: 0,
+                character: 4,
+            },
+            end: Position {
+                line: 0,
+                character: 7,
+            },
         };
         let span = range_to_span(code, &range);
         let cursor_pos = 5; // middle of "foo"
@@ -307,8 +323,14 @@ mod tests {
     fn cursor_outside_diagnostic_is_not_detected() {
         let code = "let foo = 1";
         let range = Range {
-            start: Position { line: 0, character: 4 },
-            end: Position { line: 0, character: 7 },
+            start: Position {
+                line: 0,
+                character: 4,
+            },
+            end: Position {
+                line: 0,
+                character: 7,
+            },
         };
         let span = range_to_span(code, &range);
         let cursor_pos = 10; // after "foo"
