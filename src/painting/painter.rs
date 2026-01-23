@@ -3,6 +3,7 @@ use crate::{CursorConfig, PromptEditMode, PromptViMode};
 use {
     super::utils::{coerce_crlf, line_width},
     crate::{
+        highlighter::Highlighter,
         menu::{Menu, ReedlineMenu},
         painting::PromptLines,
         Prompt,
@@ -207,6 +208,7 @@ impl Painter {
         menu: Option<&ReedlineMenu>,
         use_ansi_coloring: bool,
         cursor_config: &Option<CursorConfig>,
+        highlighter: Option<&dyn Highlighter>,
     ) -> Result<()> {
         // Reset any ANSI styling that may have been left by external commands
         // This ensures the prompt is not affected by previous output styling
@@ -265,9 +267,9 @@ impl Painter {
             .queue(Clear(ClearType::FromCursorDown))?;
 
         if self.large_buffer {
-            self.print_large_buffer(prompt, lines, menu, use_ansi_coloring)?;
+            self.print_large_buffer(prompt, lines, menu, use_ansi_coloring, highlighter)?;
         } else {
-            self.print_small_buffer(prompt, lines, menu, use_ansi_coloring)?;
+            self.print_small_buffer(prompt, lines, menu, use_ansi_coloring, highlighter)?;
         }
 
         // Print diagnostic messages below the buffer (only when no menu is active)
@@ -331,6 +333,7 @@ impl Painter {
         menu: &dyn Menu,
         lines: &PromptLines,
         use_ansi_coloring: bool,
+        highlighter: Option<&dyn Highlighter>,
     ) -> Result<()> {
         let screen_width = self.screen_width();
         let screen_height = self.screen_height();
@@ -345,7 +348,8 @@ impl Painter {
         };
 
         let remaining_lines = screen_height.saturating_sub(starting_row);
-        let menu_string = menu.menu_string(remaining_lines, use_ansi_coloring);
+        let menu_string =
+            menu.menu_string_with_highlighter(remaining_lines, use_ansi_coloring, highlighter);
         self.stdout
             .queue(cursor::MoveTo(0, starting_row))?
             .queue(Clear(ClearType::FromCursorDown))?
@@ -397,6 +401,7 @@ impl Painter {
         lines: &PromptLines,
         menu: Option<&ReedlineMenu>,
         use_ansi_coloring: bool,
+        highlighter: Option<&dyn Highlighter>,
     ) -> Result<()> {
         // print our prompt with color
         if use_ansi_coloring {
@@ -434,7 +439,7 @@ impl Painter {
             .queue(Print(&lines.after_cursor))?;
 
         if let Some(menu) = menu {
-            self.print_menu(menu, lines, use_ansi_coloring)?;
+            self.print_menu(menu, lines, use_ansi_coloring, highlighter)?;
         } else {
             self.stdout.queue(Print(&lines.hint))?;
         }
@@ -448,6 +453,7 @@ impl Painter {
         lines: &PromptLines,
         menu: Option<&ReedlineMenu>,
         use_ansi_coloring: bool,
+        highlighter: Option<&dyn Highlighter>,
     ) -> Result<()> {
         let screen_width = self.screen_width();
         let screen_height = self.screen_height();
@@ -531,7 +537,7 @@ impl Painter {
             } else {
                 self.stdout.queue(Print(&lines.after_cursor))?;
             }
-            self.print_menu(menu, lines, use_ansi_coloring)?;
+            self.print_menu(menu, lines, use_ansi_coloring, highlighter)?;
         } else {
             // Selecting lines for the hint
             // The -1 subtraction is done because the remaining lines consider the line where the

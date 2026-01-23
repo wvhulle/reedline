@@ -10,6 +10,7 @@ use nu_ansi_term::{ansi::RESET, Style};
 use unicode_width::UnicodeWidthStr;
 
 use super::{Menu, MenuBuilder, MenuEvent, MenuSettings};
+use crate::Highlighter;
 use crate::{
     core_editor::Editor,
     lsp::{range_to_span, Span},
@@ -124,23 +125,43 @@ impl DiagnosticFixMenu {
         self.fixes.get(self.selected)
     }
 
-    /// Format a single fix line: `>replacement_text (title)`
-    fn format_fix_line(&self, fix: &FixInfo, index: usize, use_ansi_coloring: bool) -> String {
+    /// Format a single fix line with optional syntax highlighting
+    fn format_fix_line(
+        &self,
+        fix: &FixInfo,
+        index: usize,
+        use_ansi_coloring: bool,
+        highlighter: Option<&dyn Highlighter>,
+    ) -> String {
         let replacement_text = fix.first_replacement_text();
+        let is_selected = index == self.selected;
 
-        let content = format!(
-            "{replacement_text} {}({}){}",
-            Style::new().italic().prefix(),
-            fix.title,
-            RESET
-        );
-
-        let (indicator, style) = match (index == self.selected, use_ansi_coloring) {
-            (true, true) => ("> ", Style::new().bold().reverse()),
-            _ => ("  ", Style::new().reverse()),
+        // Apply syntax highlighting to replacement text if available
+        let styled_replacement = if use_ansi_coloring {
+            if let Some(h) = highlighter {
+                let styled = h.highlight(replacement_text, replacement_text.len());
+                styled.render_simple()
+            } else {
+                replacement_text.to_string()
+            }
+        } else {
+            replacement_text.to_string()
         };
 
-        format!("{indicator}{}{content}{RESET}", style.prefix())
+        // Use simple indicator for selection, no background colors
+        let indicator = if is_selected { "> " } else { "  " };
+
+        let title_style = if use_ansi_coloring {
+            Style::new().italic()
+        } else {
+            Style::new()
+        };
+
+        format!(
+            "{indicator}{styled_replacement} {}({}){RESET}",
+            title_style.prefix(),
+            fix.title,
+        )
     }
 
     /// Move selection forward, wrapping around
@@ -221,8 +242,10 @@ impl Menu for DiagnosticFixMenu {
                 self.skip_values = 0;
             }
             MenuEvent::Deactivate => self.active = false,
-            MenuEvent::NextElement => self.select_next(),
-            MenuEvent::PreviousElement => self.select_previous(),
+            // Handle both NextElement (Tab) and MoveDown (arrow key)
+            MenuEvent::NextElement | MenuEvent::MoveDown => self.select_next(),
+            // Handle both PreviousElement (Shift+Tab) and MoveUp (arrow key)
+            MenuEvent::PreviousElement | MenuEvent::MoveUp => self.select_previous(),
             _ => {}
         }
     }
@@ -302,6 +325,15 @@ impl Menu for DiagnosticFixMenu {
     }
 
     fn menu_string(&self, available_lines: u16, use_ansi_coloring: bool) -> String {
+        self.menu_string_with_highlighter(available_lines, use_ansi_coloring, None)
+    }
+
+    fn menu_string_with_highlighter(
+        &self,
+        available_lines: u16,
+        use_ansi_coloring: bool,
+        highlighter: Option<&dyn Highlighter>,
+    ) -> String {
         if self.fixes.is_empty() {
             return String::from("No fixes available");
         }
@@ -317,7 +349,7 @@ impl Menu for DiagnosticFixMenu {
             .map(|(idx, fix)| {
                 format!(
                     "{left_padding}{}",
-                    self.format_fix_line(fix, idx, use_ansi_coloring)
+                    self.format_fix_line(fix, idx, use_ansi_coloring, highlighter)
                 )
             })
             .join("\r\n")

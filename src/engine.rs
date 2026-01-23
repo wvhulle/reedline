@@ -1789,6 +1789,7 @@ impl Reedline {
                 None,
                 self.use_ansi_coloring,
                 &self.cursor_shapes,
+                Some(self.highlighter.as_ref()),
             )?;
         }
 
@@ -1896,6 +1897,7 @@ impl Reedline {
             menu,
             self.use_ansi_coloring,
             &self.cursor_shapes,
+            Some(self.highlighter.as_ref()),
         )
     }
 

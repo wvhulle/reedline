@@ -8,7 +8,10 @@ pub mod menu_functions;
 
 use crate::core_editor::Editor;
 use crate::History;
-use crate::{completion::history::HistoryCompleter, painting::Painter, Completer, Suggestion};
+use crate::{
+    completion::history::HistoryCompleter, highlighter::Highlighter, painting::Painter, Completer,
+    Suggestion,
+};
 pub use columnar_menu::ColumnarMenu;
 pub use columnar_menu::TraversalDirection;
 pub use description_menu::DescriptionMenu;
@@ -143,6 +146,18 @@ pub trait Menu: Send {
 
     /// Creates the menu representation as a string which will be painted by the painter
     fn menu_string(&self, available_lines: u16, use_ansi_coloring: bool) -> String;
+
+    /// Creates the menu representation with optional syntax highlighting support.
+    /// Menus that support highlighting should override this method.
+    /// Default implementation falls back to menu_string().
+    fn menu_string_with_highlighter(
+        &self,
+        available_lines: u16,
+        use_ansi_coloring: bool,
+        _highlighter: Option<&dyn Highlighter>,
+    ) -> String {
+        self.menu_string(available_lines, use_ansi_coloring)
+    }
 
     /// Minimum rows that should be displayed by the menu
     fn min_rows(&self) -> u16;
@@ -462,6 +477,16 @@ impl Menu for ReedlineMenu {
     fn menu_string(&self, available_lines: u16, use_ansi_coloring: bool) -> String {
         self.as_ref()
             .menu_string(available_lines, use_ansi_coloring)
+    }
+
+    fn menu_string_with_highlighter(
+        &self,
+        available_lines: u16,
+        use_ansi_coloring: bool,
+        highlighter: Option<&dyn Highlighter>,
+    ) -> String {
+        self.as_ref()
+            .menu_string_with_highlighter(available_lines, use_ansi_coloring, highlighter)
     }
 
     fn min_rows(&self) -> u16 {

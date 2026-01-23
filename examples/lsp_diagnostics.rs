@@ -94,4 +94,15 @@ fn add_diagnostic_fix_keybinding(keybindings: &mut Keybindings) {
         KeyCode::Char('.'),
         ReedlineEvent::OpenDiagnosticFixMenu,
     );
+    // Add Tab/Shift-Tab for menu navigation
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::MenuNext,
+    );
+    keybindings.add_binding(
+        KeyModifiers::SHIFT,
+        KeyCode::BackTab,
+        ReedlineEvent::MenuPrevious,
+    );
 }
