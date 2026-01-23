@@ -206,18 +206,24 @@ impl DiagnosticFixMenu {
                 let original_text = first_edit.map_or("", |e| e.original.as_str());
 
                 if replacement_text.is_empty() {
-                    // Deletion: show original text with strikethrough
-                    let strikethrough_style = if use_ansi_coloring {
-                        Style::new().strikethrough()
+                    // Deletion: show original text with strikethrough, preserving syntax highlighting
+                    let styled_original = if use_ansi_coloring {
+                        if let Some(h) = highlighter {
+                            let mut styled = h.highlight(original_text, original_text.len());
+                            styled.transform_style_range(0, original_text.len(), |s| {
+                                s.strikethrough()
+                            });
+                            styled.render_simple()
+                        } else {
+                            let style = Style::new().strikethrough();
+                            format!("{}{}{}", style.prefix(), original_text, style.suffix())
+                        }
                     } else {
-                        Style::new()
+                        original_text.to_string()
                     };
 
                     format!(
-                        "{indicator}{}{}{} {}({}){RESET}",
-                        strikethrough_style.prefix(),
-                        original_text,
-                        strikethrough_style.suffix(),
+                        "{indicator}{styled_original} {}({}){RESET}",
                         title_style.prefix(),
                         fix.title,
                     )
