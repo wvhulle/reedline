@@ -19,9 +19,10 @@
 mod actions;
 mod client;
 mod diagnostic;
+mod worker;
 
-pub use client::{LspConfig, LspDiagnosticsProvider};
+pub use client::{LspCommandSender, LspConfig, LspDiagnosticsProvider};
 pub use diagnostic::{
-    format_diagnostic_messages, range_to_span, underline_style, CodeAction, Diagnostic,
-    DiagnosticSeverity, Span, TextEdit,
+    format_diagnostic_messages, range_to_span, CodeAction, Diagnostic, DiagnosticSeverity, Span,
+    TextEdit,
 };

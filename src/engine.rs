@@ -4,10 +4,7 @@ use itertools::Itertools;
 use nu_ansi_term::{Color, Style};
 
 #[cfg(feature = "lsp_diagnostics")]
-use crate::lsp::{
-    format_diagnostic_messages, range_to_span, underline_style, DiagnosticSeverity,
-    LspDiagnosticsProvider,
-};
+use crate::lsp::{format_diagnostic_messages, range_to_span, LspDiagnosticsProvider};
 use crate::{enums::ReedlineRawEvent, CursorConfig};
 #[cfg(feature = "bashisms")]
 use crate::{
@@ -147,6 +144,7 @@ pub struct Reedline {
     // Showcase hints based on various strategies (history, language-completion, spellcheck, etc)
     hinter: Option<Box<dyn Hinter>>,
     hide_hints: bool,
+    hide_diagnostics: bool,
 
     // Use ansi coloring or not
     use_ansi_coloring: bool,
@@ -241,6 +239,7 @@ impl Reedline {
             visual_selection_style,
             hinter,
             hide_hints: false,
+            hide_diagnostics: false,
             validator,
             use_ansi_coloring: true,
             cwd: None,
@@ -716,6 +715,7 @@ impl Reedline {
             self.suspended_state = None;
         }
         self.hide_hints = false;
+        self.hide_diagnostics = false;
 
         self.repaint(prompt)?;
 
@@ -1813,13 +1813,12 @@ impl Reedline {
             .highlighter
             .highlight(buffer_to_paint, cursor_position_in_buffer);
 
-        // Apply diagnostic styles (underlines) to the text
+        // Apply diagnostic styles (underlines) to the text while preserving syntax highlighting
         #[cfg(feature = "lsp_diagnostics")]
         if let Some(ref mut provider) = self.lsp_diagnostics {
             for diag in provider.diagnostics() {
-                let severity = diag.severity.unwrap_or(DiagnosticSeverity::WARNING);
                 let span = range_to_span(buffer_to_paint, &diag.range);
-                styled_text.style_range(span.start, span.end, underline_style(severity));
+                styled_text.transform_style_range(span.start, span.end, |s| s.underline());
             }
         }
 
@@ -1924,6 +1923,10 @@ impl Reedline {
     /// Get formatted diagnostic messages for display below the prompt.
     #[cfg(feature = "lsp_diagnostics")]
     fn get_diagnostic_display(&mut self, prompt: &dyn Prompt) -> String {
+        if self.hide_diagnostics {
+            return String::new();
+        }
+
         let edit_mode = self.prompt_edit_mode();
         let buffer = self.editor.get_buffer();
 
@@ -1996,6 +1999,9 @@ impl Reedline {
         self.menus.retain(|m| m.name() != "diagnostic_fix_menu");
 
         let mut fix_menu = DiagnosticFixMenu::default();
+        if let Some(ref provider) = self.lsp_diagnostics {
+            fix_menu.set_command_sender(provider.command_sender());
+        }
         fix_menu.set_fixes(code_actions, content, anchor_col);
         let mut menu = ReedlineMenu::EngineCompleter(Box::new(fix_menu));
         menu.menu_event(MenuEvent::Activate(false));
@@ -2030,6 +2036,7 @@ impl Reedline {
     fn submit_buffer(&mut self, prompt: &dyn Prompt) -> io::Result<EventStatus> {
         let buffer = self.editor.get_buffer().to_string();
         self.hide_hints = true;
+        self.hide_diagnostics = true;
         // Additional repaint to show the content without hints etc.
         if let Some(transient_prompt) = self.transient_prompt.take() {
             self.repaint(transient_prompt.as_ref())?;

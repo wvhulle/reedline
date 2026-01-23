@@ -7,13 +7,14 @@
 use itertools::Itertools;
 use lsp_types::{CodeAction, TextEdit};
 use nu_ansi_term::{ansi::RESET, Style};
+use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
 use super::{Menu, MenuBuilder, MenuEvent, MenuSettings};
 use crate::Highlighter;
 use crate::{
     core_editor::Editor,
-    lsp::{range_to_span, Span},
+    lsp::{range_to_span, LspCommandSender, Span},
     painting::Painter,
     Completer, Suggestion, UndoBehavior,
 };
@@ -21,20 +22,36 @@ use crate::{
 // Necessary because of indicator text of two characters `> ` to the left of selected menu item
 const LEFT_PADDING: u16 = 2;
 
+/// A single text edit with span, replacement, and original text.
+#[derive(Debug, Clone)]
+pub struct TextEditInfo {
+    /// Byte span in the buffer
+    pub span: Span,
+    /// Replacement text (empty for deletions)
+    pub replacement: String,
+    /// Original text at this span (for display)
+    pub original: String,
+}
+
+/// The action to perform for a fix.
+#[derive(Debug, Clone)]
+pub enum FixAction {
+    /// Text edits to apply to the buffer
+    TextEdits(Vec<TextEditInfo>),
+    /// LSP command to execute on the server
+    Command {
+        command: String,
+        arguments: Vec<Value>,
+    },
+}
+
 /// Pre-computed fix with byte offsets for buffer manipulation.
 #[derive(Debug, Clone)]
 struct FixInfo {
     /// Title of the fix (shown in the menu)
     title: String,
-    /// The text edits to apply, converted to byte spans
-    edits: Vec<(Span, String)>,
-}
-
-impl FixInfo {
-    /// Get the first replacement text for display
-    fn first_replacement_text(&self) -> &str {
-        self.edits.first().map_or("", |(_, text)| text.as_str())
-    }
+    /// The action to perform
+    action: FixAction,
 }
 
 /// Working details calculated during layout
@@ -66,6 +83,8 @@ pub struct DiagnosticFixMenu {
     max_height: u16,
     /// Anchor column position (start of text being replaced)
     anchor_col: u16,
+    /// Command sender for executing LSP commands
+    command_sender: Option<LspCommandSender>,
 }
 
 impl Default for DiagnosticFixMenu {
@@ -79,6 +98,7 @@ impl Default for DiagnosticFixMenu {
             working_details: WorkingDetails::default(),
             max_height: 10,
             anchor_col: 0,
+            command_sender: None,
         }
     }
 }
@@ -93,20 +113,47 @@ impl DiagnosticFixMenu {
     /// Update the available fixes from LSP code actions.
     ///
     /// Converts LSP ranges to byte offsets using the provided content.
+    /// Supports both edit-based and command-based actions.
     pub fn set_fixes(&mut self, actions: Vec<CodeAction>, content: &str, anchor_col: u16) {
         self.fixes = actions
             .into_iter()
             .filter_map(|action| {
-                let edits = extract_text_edits(&action)?;
-                let edits: Vec<(Span, String)> = edits
-                    .into_iter()
-                    .map(|edit| (range_to_span(content, &edit.range), edit.new_text))
-                    .collect();
+                // Try edit-based action first
+                if let Some(edits) = extract_text_edits(&action) {
+                    let edits: Vec<TextEditInfo> = edits
+                        .into_iter()
+                        .map(|edit| {
+                            let span = range_to_span(content, &edit.range);
+                            let original =
+                                content.get(span.start..span.end).unwrap_or("").to_string();
+                            TextEditInfo {
+                                span,
+                                replacement: edit.new_text,
+                                original,
+                            }
+                        })
+                        .collect();
 
-                (!edits.is_empty()).then_some(FixInfo {
-                    title: action.title,
-                    edits,
-                })
+                    if !edits.is_empty() {
+                        return Some(FixInfo {
+                            title: action.title,
+                            action: FixAction::TextEdits(edits),
+                        });
+                    }
+                }
+
+                // Fall back to command-based action
+                if let Some(cmd) = action.command {
+                    return Some(FixInfo {
+                        title: action.title,
+                        action: FixAction::Command {
+                            command: cmd.command,
+                            arguments: cmd.arguments.unwrap_or_default(),
+                        },
+                    });
+                }
+
+                None
             })
             .collect();
 
@@ -118,6 +165,11 @@ impl DiagnosticFixMenu {
     /// Check if there are any fixes available.
     pub fn has_fixes(&self) -> bool {
         !self.fixes.is_empty()
+    }
+
+    /// Set the command sender for executing LSP commands.
+    pub fn set_command_sender(&mut self, sender: LspCommandSender) {
+        self.command_sender = Some(sender);
     }
 
     /// Get the currently selected fix.
@@ -133,22 +185,7 @@ impl DiagnosticFixMenu {
         use_ansi_coloring: bool,
         highlighter: Option<&dyn Highlighter>,
     ) -> String {
-        let replacement_text = fix.first_replacement_text();
         let is_selected = index == self.selected;
-
-        // Apply syntax highlighting to replacement text if available
-        let styled_replacement = if use_ansi_coloring {
-            if let Some(h) = highlighter {
-                let styled = h.highlight(replacement_text, replacement_text.len());
-                styled.render_simple()
-            } else {
-                replacement_text.to_string()
-            }
-        } else {
-            replacement_text.to_string()
-        };
-
-        // Use simple indicator for selection, no background colors
         let indicator = if is_selected { "> " } else { "  " };
 
         let title_style = if use_ansi_coloring {
@@ -157,11 +194,58 @@ impl DiagnosticFixMenu {
             Style::new()
         };
 
-        format!(
-            "{indicator}{styled_replacement} {}({}){RESET}",
-            title_style.prefix(),
-            fix.title,
-        )
+        match &fix.action {
+            FixAction::TextEdits(edits) => {
+                // "Fix all" type actions: multiple edits, show title only
+                if edits.len() > 1 {
+                    return format!("{indicator}{}{}{RESET}", title_style.prefix(), fix.title,);
+                }
+
+                let first_edit = edits.first();
+                let replacement_text = first_edit.map_or("", |e| e.replacement.as_str());
+                let original_text = first_edit.map_or("", |e| e.original.as_str());
+
+                if replacement_text.is_empty() {
+                    // Deletion: show original text with strikethrough
+                    let strikethrough_style = if use_ansi_coloring {
+                        Style::new().strikethrough()
+                    } else {
+                        Style::new()
+                    };
+
+                    format!(
+                        "{indicator}{}{}{} {}({}){RESET}",
+                        strikethrough_style.prefix(),
+                        original_text,
+                        strikethrough_style.suffix(),
+                        title_style.prefix(),
+                        fix.title,
+                    )
+                } else {
+                    // Replacement: show new text with syntax highlighting
+                    let styled_replacement = if use_ansi_coloring {
+                        if let Some(h) = highlighter {
+                            let styled = h.highlight(replacement_text, replacement_text.len());
+                            styled.render_simple()
+                        } else {
+                            replacement_text.to_string()
+                        }
+                    } else {
+                        replacement_text.to_string()
+                    };
+
+                    format!(
+                        "{indicator}{styled_replacement} {}({}){RESET}",
+                        title_style.prefix(),
+                        fix.title,
+                    )
+                }
+            }
+            FixAction::Command { .. } => {
+                // Command-only: show title without parentheses
+                format!("{indicator}{}{}{RESET}", title_style.prefix(), fix.title,)
+            }
+        }
     }
 
     /// Move selection forward, wrapping around
@@ -282,33 +366,42 @@ impl Menu for DiagnosticFixMenu {
             return;
         };
 
-        // Sort edits by start position descending to apply from end to start
-        let mut edits = fix.edits.clone();
-        edits.sort_by_key(|(span, _)| std::cmp::Reverse(span.start));
+        match &fix.action {
+            FixAction::TextEdits(edits) => {
+                // Sort edits by start position descending to apply from end to start
+                let mut edits = edits.clone();
+                edits.sort_by_key(|e| std::cmp::Reverse(e.span.start));
 
-        let mut line_buffer = editor.line_buffer().clone();
+                let mut line_buffer = editor.line_buffer().clone();
 
-        // Apply all edits using fold
-        let new_buffer = edits.iter().fold(
-            line_buffer.get_buffer().to_string(),
-            |mut buf, (span, new_text)| {
-                let start = span.start.min(buf.len());
-                let end = span.end.min(buf.len());
-                buf.replace_range(start..end, new_text);
-                buf
-            },
-        );
+                // Apply all edits using fold
+                let new_buffer =
+                    edits
+                        .iter()
+                        .fold(line_buffer.get_buffer().to_string(), |mut buf, edit| {
+                            let start = edit.span.start.min(buf.len());
+                            let end = edit.span.end.min(buf.len());
+                            buf.replace_range(start..end, &edit.replacement);
+                            buf
+                        });
 
-        // Place cursor at end of first edit
-        let cursor_pos = fix
-            .edits
-            .first()
-            .map(|(span, new_text)| span.start + new_text.len())
-            .unwrap_or_else(|| line_buffer.insertion_point());
+                // Place cursor at end of first edit
+                let cursor_pos = edits
+                    .last() // After sorting descending, last is first original edit
+                    .map(|edit| edit.span.start + edit.replacement.len())
+                    .unwrap_or_else(|| line_buffer.insertion_point());
 
-        line_buffer.set_buffer(new_buffer);
-        line_buffer.set_insertion_point(cursor_pos.min(line_buffer.get_buffer().len()));
-        editor.set_line_buffer(line_buffer, UndoBehavior::CreateUndoPoint);
+                line_buffer.set_buffer(new_buffer);
+                line_buffer.set_insertion_point(cursor_pos.min(line_buffer.get_buffer().len()));
+                editor.set_line_buffer(line_buffer, UndoBehavior::CreateUndoPoint);
+            }
+            FixAction::Command { command, arguments } => {
+                // Execute the command via the LSP provider
+                if let Some(sender) = &self.command_sender {
+                    sender.execute_command(command.clone(), arguments.clone());
+                }
+            }
+        }
     }
 
     fn min_rows(&self) -> u16 {

@@ -4,22 +4,14 @@
 //! so the main editor thread is never blocked by slow LSP responses.
 
 use std::{
-    io::{BufRead, BufReader, BufWriter, Write},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
 use crossbeam::channel::{bounded, Receiver, Sender};
-use lsp_types::{
-    CodeAction, Diagnostic, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    InitializeParams, InitializedParams, PublishDiagnosticsParams, TextDocumentContentChangeEvent,
-    TextDocumentItem, VersionedTextDocumentIdentifier,
-};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use lsp_types::{CodeAction, Diagnostic};
 
-use super::{actions::request_code_actions, diagnostic::Span};
+use super::{diagnostic::Span, worker::LspWorker};
 
 /// LSP server configuration.
 #[derive(Debug, Clone)]
@@ -36,16 +28,41 @@ pub struct LspConfig {
 const CHANNEL_CAPACITY: usize = 32;
 
 /// Commands sent from main thread to worker.
-enum LspCommand {
+pub(super) enum LspCommand {
     UpdateContent(String),
-    RequestCodeActions { content: String, span: Span },
+    RequestCodeActions {
+        content: String,
+        span: Span,
+    },
+    ExecuteCommand {
+        command: String,
+        arguments: Vec<serde_json::Value>,
+    },
     Shutdown,
 }
 
 /// Responses sent from worker to main thread.
-enum LspResponse {
+pub(super) enum LspResponse {
     Diagnostics(Vec<Diagnostic>),
     CodeActions(Vec<CodeAction>),
+    CommandExecuted(bool),
+}
+
+/// Handle for sending LSP commands from outside the provider.
+///
+/// Used by `DiagnosticFixMenu` to execute command-based code actions.
+#[derive(Clone)]
+pub struct LspCommandSender {
+    tx: Sender<LspCommand>,
+}
+
+impl LspCommandSender {
+    /// Execute an LSP command (fire-and-forget, non-blocking).
+    pub fn execute_command(&self, command: String, arguments: Vec<serde_json::Value>) {
+        let _ = self
+            .tx
+            .try_send(LspCommand::ExecuteCommand { command, arguments });
+    }
 }
 
 /// LSP diagnostics provider (main thread interface).
@@ -58,25 +75,6 @@ pub struct LspDiagnosticsProvider {
     wake_rx: Receiver<()>,
     diagnostics: Vec<Diagnostic>,
     last_content_hash: u64,
-}
-
-/// Background worker that owns the LSP connection.
-struct LspWorker {
-    config: LspConfig,
-    conn: Option<Connection>,
-    uri: String,
-    version: i32,
-    command_rx: Receiver<LspCommand>,
-    response_tx: Sender<LspResponse>,
-    wake_tx: Sender<()>,
-}
-
-struct Connection {
-    #[allow(dead_code)]
-    child: Child,
-    writer: BufWriter<ChildStdin>,
-    reader: BufReader<ChildStdout>,
-    next_id: i32,
 }
 
 impl LspDiagnosticsProvider {
@@ -144,10 +142,33 @@ impl LspDiagnosticsProvider {
             match self.response_rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(LspResponse::CodeActions(actions)) => return actions,
                 Ok(LspResponse::Diagnostics(diags)) => self.diagnostics = diags,
+                Ok(LspResponse::CommandExecuted(_)) => {}
                 Err(_) => {}
             }
         }
         Vec::new()
+    }
+
+    /// Execute an LSP command on the server.
+    ///
+    /// Returns `true` if the command was executed successfully.
+    pub fn execute_command(&mut self, command: &str, arguments: Vec<serde_json::Value>) -> bool {
+        let _ = self.command_tx.try_send(LspCommand::ExecuteCommand {
+            command: command.to_string(),
+            arguments,
+        });
+
+        // Wait for response
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            match self.response_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(LspResponse::CommandExecuted(success)) => return success,
+                Ok(LspResponse::Diagnostics(diags)) => self.diagnostics = diags,
+                Ok(LspResponse::CodeActions(_)) => {}
+                Err(_) => {}
+            }
+        }
+        false
     }
 
     /// Poll for responses from worker (non-blocking).
@@ -155,7 +176,7 @@ impl LspDiagnosticsProvider {
         while let Ok(response) = self.response_rx.try_recv() {
             match response {
                 LspResponse::Diagnostics(diags) => self.diagnostics = diags,
-                LspResponse::CodeActions(_) => {} // Ignore stale code actions
+                LspResponse::CodeActions(_) | LspResponse::CommandExecuted(_) => {}
             }
         }
     }
@@ -168,6 +189,13 @@ impl LspDiagnosticsProvider {
             true
         } else {
             false
+        }
+    }
+
+    /// Get a command sender for executing LSP commands from menus.
+    pub fn command_sender(&self) -> LspCommandSender {
+        LspCommandSender {
+            tx: self.command_tx.clone(),
         }
     }
 }
@@ -187,270 +215,4 @@ fn hash_str(s: &str) -> u64 {
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
-}
-
-// Worker implementation
-
-impl LspWorker {
-    fn run(mut self) {
-        loop {
-            // Block waiting for commands (with timeout to allow graceful shutdown)
-            match self.command_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(LspCommand::Shutdown) => {
-                    self.shutdown();
-                    return;
-                }
-                Ok(LspCommand::UpdateContent(content)) => {
-                    self.handle_update_content(&content);
-                }
-                Ok(LspCommand::RequestCodeActions { content, span }) => {
-                    self.handle_code_actions_request(&content, span);
-                }
-                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
-                    self.shutdown();
-                    return;
-                }
-                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
-                    // No commands, continue loop
-                }
-            }
-        }
-    }
-
-    fn handle_update_content(&mut self, content: &str) {
-        if content.is_empty() {
-            self.send_diagnostics(Vec::new());
-            return;
-        }
-
-        if !self.ensure_init() {
-            return;
-        }
-
-        self.version += 1;
-        let Some(conn) = self.conn.as_mut() else {
-            return;
-        };
-        let Some(uri) = self.uri.parse().ok() else {
-            return;
-        };
-
-        let params = DidChangeTextDocumentParams {
-            text_document: VersionedTextDocumentIdentifier {
-                uri,
-                version: self.version,
-            },
-            content_changes: vec![TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text: content.into(),
-            }],
-        };
-        let _ = notify(conn, "textDocument/didChange", &params);
-
-        self.poll_for_diagnostics();
-    }
-
-    fn send_diagnostics(&self, diagnostics: Vec<Diagnostic>) {
-        let _ = self
-            .response_tx
-            .try_send(LspResponse::Diagnostics(diagnostics));
-        let _ = self.wake_tx.try_send(());
-    }
-
-    fn handle_code_actions_request(&mut self, content: &str, span: Span) {
-        let actions = self
-            .conn
-            .as_mut()
-            .map(|conn| {
-                request_code_actions(
-                    &self.uri,
-                    content,
-                    span,
-                    self.config.timeout_ms,
-                    |method, params, timeout| request(conn, method, params, timeout),
-                )
-            })
-            .unwrap_or_default();
-
-        let _ = self.response_tx.try_send(LspResponse::CodeActions(actions));
-    }
-
-    fn poll_for_diagnostics(&mut self) {
-        let Some(conn) = &mut self.conn else { return };
-
-        let timeout = Duration::from_millis(self.config.timeout_ms);
-        let start = Instant::now();
-
-        let diagnostics =
-            std::iter::from_fn(|| read_msg(&mut conn.reader, Duration::from_millis(5)))
-                .take_while(|_| start.elapsed() < timeout)
-                .filter(|msg| msg.method.as_deref() == Some("textDocument/publishDiagnostics"))
-                .filter_map(|msg| msg.params)
-                .filter_map(|params| {
-                    serde_json::from_value::<PublishDiagnosticsParams>(params).ok()
-                })
-                .next()
-                .map(|p| p.diagnostics);
-
-        if let Some(diagnostics) = diagnostics {
-            self.send_diagnostics(diagnostics);
-        }
-    }
-
-    fn ensure_init(&mut self) -> bool {
-        if self.conn.is_some() {
-            return true;
-        }
-        self.conn = self.try_init();
-        self.conn.is_some()
-    }
-
-    fn try_init(&self) -> Option<Connection> {
-        let mut parts = self.config.command.split_whitespace();
-        let bin = parts.next()?;
-        let args: Vec<&str> = parts.collect();
-
-        let mut child = Command::new(bin)
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-
-        let mut conn = Connection {
-            writer: BufWriter::new(child.stdin.take()?),
-            reader: BufReader::new(child.stdout.take()?),
-            child,
-            next_id: 1,
-        };
-
-        let init_params = InitializeParams {
-            process_id: Some(std::process::id()),
-            client_info: Some(lsp_types::ClientInfo {
-                name: "reedline".into(),
-                version: Some(env!("CARGO_PKG_VERSION").into()),
-            }),
-            ..Default::default()
-        };
-
-        request(
-            &mut conn,
-            "initialize",
-            &init_params,
-            self.config.timeout_ms * 5,
-        )?;
-        notify(&mut conn, "initialized", &InitializedParams {})?;
-        notify(
-            &mut conn,
-            "textDocument/didOpen",
-            &DidOpenTextDocumentParams {
-                text_document: TextDocumentItem {
-                    uri: self.uri.parse().ok()?,
-                    language_id: "nushell".into(),
-                    version: 0,
-                    text: String::new(),
-                },
-            },
-        )?;
-
-        Some(conn)
-    }
-
-    fn shutdown(&mut self) {
-        if let Some(mut conn) = self.conn.take() {
-            let _ = request(&mut conn, "shutdown", &(), 100);
-            let _ = notify(&mut conn, "exit", &());
-            thread::sleep(Duration::from_millis(20));
-            let _ = conn.child.kill();
-        }
-    }
-}
-
-// JSON-RPC helpers
-
-#[derive(Serialize, Deserialize)]
-struct Msg {
-    jsonrpc: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    method: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<Value>,
-}
-
-fn request<T: Serialize>(
-    conn: &mut Connection,
-    method: &str,
-    params: &T,
-    timeout_ms: u64,
-) -> Option<Value> {
-    let id = conn.next_id;
-    conn.next_id += 1;
-
-    let msg = Msg {
-        jsonrpc: "2.0".into(),
-        id: Some(id),
-        method: Some(method.into()),
-        params: serde_json::to_value(params).ok(),
-        result: None,
-        error: None,
-    };
-    write_msg(&mut conn.writer, &msg).ok()?;
-
-    let timeout = Duration::from_millis(timeout_ms);
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Some(resp) = read_msg(&mut conn.reader, Duration::from_millis(10)) {
-            if resp.id == Some(id) {
-                return resp.result;
-            }
-        }
-    }
-    None
-}
-
-fn notify<T: Serialize>(conn: &mut Connection, method: &str, params: &T) -> Option<()> {
-    let msg = Msg {
-        jsonrpc: "2.0".into(),
-        id: None,
-        method: Some(method.into()),
-        params: serde_json::to_value(params).ok(),
-        result: None,
-        error: None,
-    };
-    write_msg(&mut conn.writer, &msg).ok()
-}
-
-fn write_msg<W: Write>(w: &mut W, msg: &Msg) -> std::io::Result<()> {
-    let json = serde_json::to_string(msg)?;
-    write!(w, "Content-Length: {}\r\n\r\n{}", json.len(), json)?;
-    w.flush()
-}
-
-fn read_msg<R: BufRead>(r: &mut R, timeout: Duration) -> Option<Msg> {
-    let start = Instant::now();
-    let mut header = String::new();
-
-    while start.elapsed() < timeout {
-        header.clear();
-        if r.read_line(&mut header).ok()? == 0 {
-            return None;
-        }
-        if let Some(len) = header.strip_prefix("Content-Length:") {
-            let len: usize = len.trim().parse().ok()?;
-            let mut empty = String::new();
-            r.read_line(&mut empty).ok()?;
-            let mut buf = vec![0u8; len];
-            r.read_exact(&mut buf).ok()?;
-            return serde_json::from_slice(&buf).ok();
-        }
-    }
-    None
 }
