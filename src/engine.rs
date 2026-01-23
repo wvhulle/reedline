@@ -1951,6 +1951,7 @@ impl Reedline {
                 None,
                 self.use_ansi_coloring,
                 &self.cursor_shapes,
+                Some(self.highlighter.as_ref()),
             )?;
         }
 
@@ -2051,6 +2052,8 @@ impl Reedline {
 
         let menu = self.menus.iter().find(|menu| menu.is_active());
 
+        
+
         self.painter.repaint_buffer(
             prompt,
             &lines,
@@ -2058,6 +2061,7 @@ impl Reedline {
             menu,
             self.use_ansi_coloring,
             &self.cursor_shapes,
+            Some(self.highlighter.as_ref()),
         )?;
 
         if self.mouse_click_mode.is_enabled() {

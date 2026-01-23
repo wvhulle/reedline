@@ -247,3 +247,82 @@ fn style_text(text: &str, severity: DiagnosticSeverity, use_ansi_coloring: bool)
         text.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lsp_types::Position;
+    use pretty_assertions::assert_eq;
+
+    // User expectation: diagnostic underline appears under the correct text
+
+    #[test]
+    fn diagnostic_covers_single_char_variable() {
+        let code = "let x = 1";
+        let range = Range {
+            start: Position { line: 0, character: 4 },
+            end: Position { line: 0, character: 5 },
+        };
+        let span = range_to_span(code, &range);
+        assert_eq!(&code[span.start..span.end], "x");
+    }
+
+    #[test]
+    fn diagnostic_covers_multi_char_identifier() {
+        let code = "let foo = bar";
+        let range = Range {
+            start: Position { line: 0, character: 4 },
+            end: Position { line: 0, character: 7 },
+        };
+        let span = range_to_span(code, &range);
+        assert_eq!(&code[span.start..span.end], "foo");
+    }
+
+    #[test]
+    fn diagnostic_on_second_line() {
+        let code = "let x = 1\nlet y = 2";
+        let range = Range {
+            start: Position { line: 1, character: 4 },
+            end: Position { line: 1, character: 5 },
+        };
+        let span = range_to_span(code, &range);
+        assert_eq!(&code[span.start..span.end], "y");
+    }
+
+    // User expectation: cursor inside diagnostic span is detected
+
+    #[test]
+    fn cursor_inside_diagnostic_is_detected() {
+        let code = "let foo = 1";
+        let range = Range {
+            start: Position { line: 0, character: 4 },
+            end: Position { line: 0, character: 7 },
+        };
+        let span = range_to_span(code, &range);
+        let cursor_pos = 5; // middle of "foo"
+        assert!(span.start <= cursor_pos && cursor_pos <= span.end);
+    }
+
+    #[test]
+    fn cursor_outside_diagnostic_is_not_detected() {
+        let code = "let foo = 1";
+        let range = Range {
+            start: Position { line: 0, character: 4 },
+            end: Position { line: 0, character: 7 },
+        };
+        let span = range_to_span(code, &range);
+        let cursor_pos = 10; // after "foo"
+        assert!(!(span.start <= cursor_pos && cursor_pos <= span.end));
+    }
+
+    // User expectation: diagnostic aligns correctly after wide characters
+
+    #[test]
+    fn diagnostic_aligns_after_cjk_characters() {
+        let code = "日本語 error";
+        // "error" starts at byte 10 (3 CJK chars × 3 bytes + 1 space)
+        let span = Span::new(10, 15);
+        // CJK chars are 2 columns each: 日(2) + 本(2) + 語(2) + space(1) = 7 columns
+        assert_eq!(span.start_column(code), 7);
+    }
+}
