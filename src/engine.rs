@@ -4,7 +4,7 @@ use itertools::Itertools;
 use nu_ansi_term::{Color, Style};
 
 #[cfg(feature = "lsp_diagnostics")]
-use crate::lsp::{Diagnostic, LspDiagnosticsProvider};
+use crate::lsp::LspDiagnosticsProvider;
 use crate::{enums::ReedlineRawEvent, CursorConfig};
 #[cfg(feature = "bashisms")]
 use crate::{
@@ -63,29 +63,6 @@ const POLL_WAIT: Duration = Duration::from_millis(100);
 // time, we specify how many events should be in the `crossterm_events` vector
 // before it is considered a paste. 10 events is conservative enough.
 const EVENTS_THRESHOLD: usize = 10;
-
-/// Convert a byte offset in a string to a visual column position.
-///
-/// This accounts for unicode character widths (e.g., CJK characters are 2 columns wide).
-/// If the byte offset falls in the middle of a multibyte character, we count up to
-/// (but not including) that character.
-#[cfg(feature = "lsp_diagnostics")]
-fn byte_offset_to_column(s: &str, byte_offset: usize) -> usize {
-    use unicode_width::UnicodeWidthChar;
-
-    let clamped = byte_offset.min(s.len());
-    let mut col = 0;
-    let mut current_byte = 0;
-
-    for c in s.chars() {
-        if current_byte >= clamped {
-            break;
-        }
-        col += c.width().unwrap_or(0);
-        current_byte += c.len_utf8();
-    }
-    col
-}
 
 /// Strip ANSI escape sequences from a string.
 ///
@@ -1977,10 +1954,13 @@ impl Reedline {
 
         // Apply diagnostic styles (underlines) to the text
         #[cfg(feature = "lsp_diagnostics")]
-        if let Some(ref provider) = self.lsp_diagnostics {
+        if let Some(ref mut provider) = self.lsp_diagnostics {
+            use crate::lsp::{message_style, range_to_span, DiagnosticSeverity};
             for diag in provider.diagnostics() {
-                let style = diag.severity.default_style();
-                styled_text.style_range(diag.span.start, diag.span.end, style);
+                let severity = diag.severity.unwrap_or(DiagnosticSeverity::INFORMATION);
+                let style = message_style(severity);
+                let span = range_to_span(buffer_to_paint, &diag.range);
+                styled_text.style_range(span.start, span.end, style);
             }
         }
 
@@ -2161,12 +2141,14 @@ impl Reedline {
     /// ╰ Use 'first N' to get the first N items
     /// ```
     #[cfg(feature = "lsp_diagnostics")]
-    fn format_diagnostic_messages(&self, prompt: &dyn Prompt) -> String {
-        let Some(ref provider) = self.lsp_diagnostics else {
-            return String::new();
-        };
+    fn format_diagnostic_messages(&mut self, prompt: &dyn Prompt) -> String {
+        // Get diagnostics - need to clone to avoid borrow issues
+        let diagnostics: Vec<_> = self
+            .lsp_diagnostics
+            .as_mut()
+            .map(|p| p.diagnostics().to_vec())
+            .unwrap_or_default();
 
-        let diagnostics = provider.diagnostics();
         if diagnostics.is_empty() {
             return String::new();
         }
@@ -2182,102 +2164,12 @@ impl Reedline {
             unicode_width::UnicodeWidthStr::width(strip_ansi(last_prompt_line).as_str())
                 + unicode_width::UnicodeWidthStr::width(strip_ansi(&prompt_indicator).as_str());
 
-        // Collect diagnostics with their visual columns (start and end), sorted by start column
-        let mut diag_cols: Vec<_> = diagnostics
-            .iter()
-            .map(|d| {
-                let start_col = prompt_width + byte_offset_to_column(buffer, d.span.start);
-                let end_col = prompt_width + byte_offset_to_column(buffer, d.span.end);
-                (start_col, end_col, d)
-            })
-            .collect();
-        diag_cols.sort_by_key(|(start, _, _)| *start);
-
-        let mut output = String::new();
-        for (i, (start_col, end_col, diag)) in diag_cols.iter().enumerate() {
-            // Columns that need vertical lines (diagnostics after this one)
-            // Include the diagnostic reference to style vertical bars with matching severity
-            let future_diags: Vec<(usize, &Diagnostic)> = diag_cols[i + 1..]
-                .iter()
-                .map(|(c, _, d)| (*c, *d))
-                .collect();
-
-            let styled_message = if self.use_ansi_coloring {
-                diag.severity
-                    .message_style()
-                    .paint(&diag.message)
-                    .to_string()
-            } else {
-                diag.message.clone()
-            };
-
-            if !output.is_empty() {
-                output.push('\n');
-            }
-
-            // Build the line character by character
-            let mut line = String::new();
-            let mut col = 0;
-
-            // Add vertical lines for future diagnostics that come before this one's column
-            for (future_col, future_diag) in &future_diags {
-                if *future_col < *start_col {
-                    // Add spaces up to this column, then a vertical bar
-                    while col < *future_col {
-                        line.push(' ');
-                        col += 1;
-                    }
-                    if self.use_ansi_coloring {
-                        line.push_str(&future_diag.severity.message_style().paint("╎").to_string());
-                    } else {
-                        line.push('╎');
-                    }
-                    col += 1;
-                }
-            }
-
-            // Pad to the current diagnostic's column
-            while col < *start_col {
-                line.push(' ');
-                col += 1;
-            }
-
-            // Calculate span width for the horizontal line
-            let span_width = end_col.saturating_sub(*start_col);
-
-            // Add the corner, optional horizontal extension, and message
-            // Style connectors with the diagnostic's severity color
-            if span_width <= 1 {
-                // Single character span: just corner
-                if self.use_ansi_coloring {
-                    line.push_str(&diag.severity.message_style().paint("╰").to_string());
-                    line.push(' ');
-                } else {
-                    line.push_str("╰ ");
-                }
-            } else {
-                // Multi-character span: corner + horizontal line + end terminator
-                if self.use_ansi_coloring {
-                    let style = diag.severity.message_style();
-                    line.push_str(&style.paint("╰").to_string());
-                    for _ in 0..span_width.saturating_sub(2) {
-                        line.push_str(&style.paint("─").to_string());
-                    }
-                    line.push_str(&style.paint("╯").to_string());
-                    line.push(' ');
-                } else {
-                    line.push('╰');
-                    for _ in 0..span_width.saturating_sub(2) {
-                        line.push('─');
-                    }
-                    line.push_str("╯ ");
-                }
-            }
-            line.push_str(&styled_message);
-
-            output.push_str(&line);
-        }
-        output
+        crate::lsp::format_diagnostic_messages(
+            &diagnostics,
+            buffer,
+            prompt_width,
+            self.use_ansi_coloring,
+        )
     }
 
     /// Open the diagnostic fix menu with available fixes at the cursor position.
@@ -2288,8 +2180,8 @@ impl Reedline {
     /// Returns `true` if the menu was opened, `false` if there were no fixes.
     #[cfg(feature = "lsp_diagnostics")]
     fn open_diagnostic_fix_menu(&mut self) -> bool {
-        use crate::lsp::Span;
-        use crate::menu::{DiagnosticFixMenu, FixOption};
+        use crate::lsp::{range_to_span, Span};
+        use crate::menu::DiagnosticFixMenu;
 
         let Some(ref mut provider) = self.lsp_diagnostics else {
             return false;
@@ -2302,8 +2194,11 @@ impl Reedline {
         let diagnostic_span = provider
             .diagnostics()
             .iter()
-            .find(|d| d.span.start <= cursor_pos && cursor_pos <= d.span.end)
-            .map(|d| d.span);
+            .find(|d| {
+                let span = range_to_span(content, &d.range);
+                span.start <= cursor_pos && cursor_pos <= span.end
+            })
+            .map(|d| range_to_span(content, &d.range));
 
         let span = match diagnostic_span {
             Some(s) => s,
@@ -2320,23 +2215,10 @@ impl Reedline {
             return false;
         }
 
-        // Convert code actions to fix options
-        let fixes: Vec<FixOption> = code_actions
-            .iter()
-            .map(FixOption::from_code_action)
-            .collect();
-
-        // Calculate the anchor column based on the first replacement of the first fix
-        // This ensures the menu aligns below the text that will be replaced
+        // Calculate the anchor column based on the span start
         use unicode_width::UnicodeWidthStr;
-        let first_replacement_start = fixes
-            .first()
-            .and_then(|f| f.replacements.first())
-            .map(|r| r.span.start)
-            .unwrap_or(span.start);
-
-        let anchor_col = if first_replacement_start <= content.len() {
-            content[..first_replacement_start].width() as u16
+        let anchor_col = if span.start <= content.len() {
+            content[..span.start].width() as u16
         } else {
             0
         };
@@ -2347,7 +2229,7 @@ impl Reedline {
 
         // Create a new menu with fixes, positioned at the start of the diagnostic span
         let mut fix_menu = DiagnosticFixMenu::default();
-        fix_menu.set_fixes(fixes, anchor_col);
+        fix_menu.set_fixes(code_actions, content, anchor_col);
         let mut menu = ReedlineMenu::EngineCompleter(Box::new(fix_menu));
         menu.menu_event(MenuEvent::Activate(false));
         self.menus.push(menu);
@@ -2560,46 +2442,5 @@ mod tests {
             markers.prompt_start(PromptKind::Primary).as_ref(),
             "\x1b]133;A;k=i;click_events=1\x1b\\"
         );
-    }
-
-    #[cfg(feature = "lsp_diagnostics")]
-    mod lsp_tests {
-        use super::byte_offset_to_column;
-
-        #[test]
-        fn test_byte_offset_to_column_ascii() {
-            assert_eq!(byte_offset_to_column("hello", 0), 0);
-            assert_eq!(byte_offset_to_column("hello", 1), 1);
-            assert_eq!(byte_offset_to_column("hello", 5), 5);
-            assert_eq!(byte_offset_to_column("hello", 10), 5); // clamped
-        }
-
-        #[test]
-        fn test_byte_offset_to_column_unicode() {
-            // "é" is 2 bytes (UTF-8: C3 A9), so "café" = c(1) + a(1) + f(1) + é(2) = 5 bytes
-            let s = "café";
-            assert_eq!(byte_offset_to_column(s, 0), 0); // before 'c'
-            assert_eq!(byte_offset_to_column(s, 1), 1); // after 'c'
-            assert_eq!(byte_offset_to_column(s, 3), 3); // after 'f'
-                                                        // byte 4 is inside 'é' (2nd byte) - we include chars whose start byte < offset
-                                                        // 'é' starts at byte 3, and 3 < 4, so we include it
-            assert_eq!(byte_offset_to_column(s, 4), 4); // after 'é'
-            assert_eq!(byte_offset_to_column(s, 5), 4); // at end
-        }
-
-        #[test]
-        fn test_byte_offset_to_column_wide_chars() {
-            // CJK characters are typically 2 columns wide
-            // "日" is 3 bytes in UTF-8, so "a日b" = a(1) + 日(3) + b(1) = 5 bytes
-            let s = "a日b";
-            assert_eq!(byte_offset_to_column(s, 0), 0); // before 'a'
-            assert_eq!(byte_offset_to_column(s, 1), 1); // after 'a', before '日'
-                                                        // bytes 2-3 are inside '日' - we include chars whose start byte < offset
-                                                        // '日' starts at byte 1, and 1 < 2, so we include it
-            assert_eq!(byte_offset_to_column(s, 2), 3); // '日' is 2 cols wide
-            assert_eq!(byte_offset_to_column(s, 3), 3); // still inside '日'
-            assert_eq!(byte_offset_to_column(s, 4), 3); // after '日', before 'b'
-            assert_eq!(byte_offset_to_column(s, 5), 4); // after 'b'
-        }
     }
 }
