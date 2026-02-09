@@ -2148,8 +2148,13 @@ impl Reedline {
         let menu_name = "diagnostic_fix_menu";
         self.menus.retain(|m| m.name() != menu_name);
 
-        // Create the menu using the integration helper
-        if let Some(menu) = crate::lsp::create_diagnostic_fix_menu(provider, cursor_pos, content) {
+        // Create the menu using the integration helper, passing highlighter for pre-highlighting
+        if let Some(menu) = crate::lsp::create_diagnostic_fix_menu(
+            provider,
+            cursor_pos,
+            content,
+            Some(self.highlighter.as_ref()),
+        ) {
             self.menus.push(menu);
             true
         } else {

@@ -10,7 +10,10 @@ use super::{
     diagnostic::{format_diagnostic_messages, message_style, range_to_span, Span},
     LspDiagnosticsProvider,
 };
-use crate::{menu::DiagnosticFixMenu, painting::StyledText, Menu, MenuEvent, Prompt, ReedlineMenu};
+use crate::{
+    menu::DiagnosticFixMenu, painting::StyledText, Highlighter, Menu, MenuEvent, Prompt,
+    ReedlineMenu,
+};
 
 /// Strip ANSI escape sequences from a string.
 ///
@@ -74,10 +77,14 @@ pub fn format_diagnostics_for_prompt(
 ///
 /// Returns `Some(ReedlineMenu)` if there are code actions available,
 /// `None` if there are no fixes at the cursor position.
+///
+/// When a highlighter is provided, the fix menu pre-highlights replacement text
+/// at setup time, avoiding repeated highlighting work on each render pass.
 pub fn create_diagnostic_fix_menu(
     provider: &mut LspDiagnosticsProvider,
     cursor_pos: usize,
     content: &str,
+    highlighter: Option<&dyn Highlighter>,
 ) -> Option<ReedlineMenu> {
     // Find diagnostics at cursor position to determine the span for code actions
     let diagnostic_span = provider
@@ -110,7 +117,7 @@ pub fn create_diagnostic_fix_menu(
 
     // Create a new menu with fixes, positioned at the start of the diagnostic span
     let mut fix_menu = DiagnosticFixMenu::default();
-    fix_menu.set_fixes(code_actions, content, anchor_col);
+    fix_menu.set_fixes(code_actions, content, anchor_col, highlighter);
     fix_menu.set_command_sender(provider.command_sender());
 
     let mut menu = ReedlineMenu::EngineCompleter(Box::new(fix_menu));

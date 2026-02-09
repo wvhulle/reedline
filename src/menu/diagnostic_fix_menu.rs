@@ -27,10 +27,14 @@ const LEFT_PADDING: u16 = 2;
 pub struct TextEditInfo {
     /// Byte span in the buffer
     pub span: Span,
-    /// Replacement text (empty for deletions)
+    /// Replacement text (empty for deletions) - raw text for buffer operations
     pub replacement: String,
-    /// Original text at this span (for display)
+    /// Pre-highlighted ANSI string for display (may include syntax highlighting)
+    pub replacement_styled: String,
+    /// Original text at this span - raw text
     pub original: String,
+    /// Pre-highlighted ANSI string with strikethrough for deletions
+    pub original_styled: String,
 }
 
 /// The action to perform for a fix.
@@ -114,7 +118,16 @@ impl DiagnosticFixMenu {
     ///
     /// Converts LSP ranges to byte offsets using the provided content.
     /// Supports both edit-based and command-based actions.
-    pub fn set_fixes(&mut self, actions: Vec<CodeAction>, content: &str, anchor_col: u16) {
+    ///
+    /// When a highlighter is provided, replacement and original text are pre-highlighted
+    /// at setup time, avoiding repeated highlighting work on each render pass.
+    pub fn set_fixes(
+        &mut self,
+        actions: Vec<CodeAction>,
+        content: &str,
+        anchor_col: u16,
+        highlighter: Option<&dyn Highlighter>,
+    ) {
         self.fixes = actions
             .into_iter()
             .filter_map(|action| {
@@ -126,10 +139,33 @@ impl DiagnosticFixMenu {
                             let span = range_to_span(content, &edit.range);
                             let original =
                                 content.get(span.start..span.end).unwrap_or("").to_string();
+                            let replacement = edit.new_text;
+
+                            // Pre-highlight the replacement text
+                            let replacement_styled = if let Some(h) = highlighter {
+                                h.highlight(&replacement, replacement.len()).render_simple()
+                            } else {
+                                replacement.clone()
+                            };
+
+                            // Pre-highlight the original text with strikethrough for deletions
+                            let original_styled = if let Some(h) = highlighter {
+                                let mut styled = h.highlight(&original, original.len());
+                                styled.transform_style_range(0, original.len(), |s| {
+                                    s.strikethrough()
+                                });
+                                styled.render_simple()
+                            } else {
+                                let style = Style::new().strikethrough();
+                                format!("{}{}{}", style.prefix(), original, style.suffix())
+                            };
+
                             TextEditInfo {
                                 span,
-                                replacement: edit.new_text,
+                                replacement,
+                                replacement_styled,
                                 original,
+                                original_styled,
                             }
                         })
                         .collect();
@@ -177,14 +213,8 @@ impl DiagnosticFixMenu {
         self.fixes.get(self.selected)
     }
 
-    /// Format a single fix line with optional syntax highlighting
-    fn format_fix_line(
-        &self,
-        fix: &FixInfo,
-        index: usize,
-        use_ansi_coloring: bool,
-        highlighter: Option<&dyn Highlighter>,
-    ) -> String {
+    /// Format a single fix line using pre-computed styled text.
+    fn format_fix_line(&self, fix: &FixInfo, index: usize, use_ansi_coloring: bool) -> String {
         let is_selected = index == self.selected;
         let indicator = if is_selected { "> " } else { "  " };
 
@@ -203,23 +233,13 @@ impl DiagnosticFixMenu {
 
                 let first_edit = edits.first();
                 let replacement_text = first_edit.map_or("", |e| e.replacement.as_str());
-                let original_text = first_edit.map_or("", |e| e.original.as_str());
 
                 if replacement_text.is_empty() {
-                    // Deletion: show original text with strikethrough, preserving syntax highlighting
+                    // Deletion: show original text with strikethrough (pre-computed)
                     let styled_original = if use_ansi_coloring {
-                        if let Some(h) = highlighter {
-                            let mut styled = h.highlight(original_text, original_text.len());
-                            styled.transform_style_range(0, original_text.len(), |s| {
-                                s.strikethrough()
-                            });
-                            styled.render_simple()
-                        } else {
-                            let style = Style::new().strikethrough();
-                            format!("{}{}{}", style.prefix(), original_text, style.suffix())
-                        }
+                        first_edit.map_or(String::new(), |e| e.original_styled.clone())
                     } else {
-                        original_text.to_string()
+                        first_edit.map_or(String::new(), |e| e.original.clone())
                     };
 
                     format!(
@@ -228,16 +248,11 @@ impl DiagnosticFixMenu {
                         fix.title,
                     )
                 } else {
-                    // Replacement: show new text with syntax highlighting
+                    // Replacement: show new text (pre-computed with syntax highlighting)
                     let styled_replacement = if use_ansi_coloring {
-                        if let Some(h) = highlighter {
-                            let styled = h.highlight(replacement_text, replacement_text.len());
-                            styled.render_simple()
-                        } else {
-                            replacement_text.to_string()
-                        }
+                        first_edit.map_or(String::new(), |e| e.replacement_styled.clone())
                     } else {
-                        replacement_text.to_string()
+                        first_edit.map_or(String::new(), |e| e.replacement.clone())
                     };
 
                     format!(
@@ -431,8 +446,9 @@ impl Menu for DiagnosticFixMenu {
         &self,
         available_lines: u16,
         use_ansi_coloring: bool,
-        highlighter: Option<&dyn Highlighter>,
+        _highlighter: Option<&dyn Highlighter>,
     ) -> String {
+        // Note: highlighter parameter is ignored - text is pre-highlighted in set_fixes()
         if self.fixes.is_empty() {
             return String::from("No fixes available");
         }
@@ -448,7 +464,7 @@ impl Menu for DiagnosticFixMenu {
             .map(|(idx, fix)| {
                 format!(
                     "{left_padding}{}",
-                    self.format_fix_line(fix, idx, use_ansi_coloring, highlighter)
+                    self.format_fix_line(fix, idx, use_ansi_coloring)
                 )
             })
             .join("\r\n")

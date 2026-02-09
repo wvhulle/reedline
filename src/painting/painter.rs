@@ -782,13 +782,13 @@ impl Painter {
             self.print_menu(menu, use_ansi_coloring, layout, highlighter)?;
         } else {
             self.stdout.queue(Print(&lines.hint))?;
-        }
 
-        // Print diagnostic messages below the input
-        if !lines.diagnostic_lines.is_empty() {
-            self.stdout
-                .queue(Print(&coerce_crlf("\n")))?
-                .queue(Print(&lines.diagnostic_lines))?;
+            // Print diagnostic messages below the input (only when no menu is active)
+            if !lines.diagnostic_lines.is_empty() {
+                self.stdout
+                    .queue(Print(&coerce_crlf("\n")))?
+                    .queue(Print(&lines.diagnostic_lines))?;
+            }
         }
 
         Ok(())
@@ -887,13 +887,13 @@ impl Painter {
             // Hint lines
             let hint_skipped = skip_buffer_lines(&lines.hint, 0, Some(offset));
             self.stdout.queue(Print(hint_skipped))?;
-        }
 
-        // Print diagnostic messages below the input
-        if !lines.diagnostic_lines.is_empty() {
-            self.stdout
-                .queue(Print(&coerce_crlf("\n")))?
-                .queue(Print(&lines.diagnostic_lines))?;
+            // Print diagnostic messages below the input (only when no menu is active)
+            if !lines.diagnostic_lines.is_empty() {
+                self.stdout
+                    .queue(Print(&coerce_crlf("\n")))?
+                    .queue(Print(&lines.diagnostic_lines))?;
+            }
         }
 
         Ok(())
