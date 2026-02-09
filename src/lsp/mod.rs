@@ -26,6 +26,4 @@ pub use client::{LspCommandSender, LspConfig, LspDiagnosticsProvider};
 pub use diagnostic::{CodeAction, Diagnostic, DiagnosticSeverity, Span, TextEdit};
 // Internal utilities used by engine and menu modules
 pub(crate) use diagnostic::range_to_span;
-pub(crate) use engine_integration::{
-    apply_diagnostic_styles, create_diagnostic_fix_menu, format_diagnostics_for_prompt,
-};
+pub(crate) use engine_integration::{create_diagnostic_fix_menu, format_diagnostics_for_prompt};

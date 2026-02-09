@@ -7,13 +7,10 @@ use lsp_types::Diagnostic;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    diagnostic::{format_diagnostic_messages, message_style, range_to_span, Span},
+    diagnostic::{format_diagnostic_messages, range_to_span, Span},
     LspDiagnosticsProvider,
 };
-use crate::{
-    menu::DiagnosticFixMenu, painting::StyledText, Highlighter, Menu, MenuEvent, Prompt,
-    ReedlineMenu,
-};
+use crate::{menu::DiagnosticFixMenu, Highlighter, Menu, MenuEvent, Prompt, ReedlineMenu};
 
 /// Strip ANSI escape sequences from a string.
 ///
@@ -22,25 +19,6 @@ use crate::{
 /// sequence types (SGR, OSC, etc).
 fn strip_ansi(s: &str) -> String {
     String::from_utf8(strip_ansi_escapes::strip(s)).unwrap_or_else(|_| s.to_string())
-}
-
-/// Apply diagnostic styles (underlines) to styled text.
-///
-/// Iterates over the provider's diagnostics and applies the appropriate
-/// severity-based styling to each diagnostic's range in the buffer.
-pub fn apply_diagnostic_styles(
-    styled_text: &mut StyledText,
-    provider: &mut LspDiagnosticsProvider,
-    buffer: &str,
-) {
-    use lsp_types::DiagnosticSeverity;
-
-    for diag in provider.diagnostics() {
-        let severity = diag.severity.unwrap_or(DiagnosticSeverity::INFORMATION);
-        let style = message_style(severity);
-        let span = range_to_span(buffer, &diag.range);
-        styled_text.style_range(span.start, span.end, style);
-    }
 }
 
 /// Format diagnostic messages for display below the prompt.

@@ -1942,12 +1942,6 @@ impl Reedline {
             .highlighter
             .highlight(buffer_to_paint, cursor_position_in_buffer);
 
-        // Apply diagnostic styles (underlines) to the text
-        #[cfg(feature = "lsp_diagnostics")]
-        if let Some(ref mut provider) = self.lsp_diagnostics {
-            crate::lsp::apply_diagnostic_styles(&mut styled_text, provider, buffer_to_paint);
-        }
-
         if let Some((from, to)) = self.editor.get_selection() {
             styled_text.style_range(from, to, self.visual_selection_style);
         }
