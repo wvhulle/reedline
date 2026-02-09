@@ -64,16 +64,6 @@ const POLL_WAIT: Duration = Duration::from_millis(100);
 // before it is considered a paste. 10 events is conservative enough.
 const EVENTS_THRESHOLD: usize = 10;
 
-/// Strip ANSI escape sequences from a string.
-///
-/// This is needed because prompts contain color codes like `\x1b[32m` which
-/// would incorrectly inflate width calculations. Uses the strip_ansi_escapes
-/// crate to handle all escape sequence types (SGR, OSC, etc).
-#[cfg(feature = "lsp_diagnostics")]
-fn strip_ansi(s: &str) -> String {
-    String::from_utf8(strip_ansi_escapes::strip(s)).unwrap_or_else(|_| s.to_string())
-}
-
 /// Default maximum time Reedline will block on input before yielding control
 /// for features that require periodic processing (e.g., external printer,
 /// idle callback).
@@ -1955,13 +1945,7 @@ impl Reedline {
         // Apply diagnostic styles (underlines) to the text
         #[cfg(feature = "lsp_diagnostics")]
         if let Some(ref mut provider) = self.lsp_diagnostics {
-            use crate::lsp::{message_style, range_to_span, DiagnosticSeverity};
-            for diag in provider.diagnostics() {
-                let severity = diag.severity.unwrap_or(DiagnosticSeverity::INFORMATION);
-                let style = message_style(severity);
-                let span = range_to_span(buffer_to_paint, &diag.range);
-                styled_text.style_range(span.start, span.end, style);
-            }
+            crate::lsp::apply_diagnostic_styles(&mut styled_text, provider, buffer_to_paint);
         }
 
         if let Some((from, to)) = self.editor.get_selection() {
@@ -1999,7 +1983,21 @@ impl Reedline {
 
         // Format diagnostic messages for display below the prompt
         #[cfg(feature = "lsp_diagnostics")]
-        let diagnostic_display = self.format_diagnostic_messages(prompt);
+        let diagnostic_display = {
+            let prompt_edit_mode = self.prompt_edit_mode();
+            let use_ansi_coloring = self.use_ansi_coloring;
+            if let Some(ref mut provider) = self.lsp_diagnostics {
+                crate::lsp::format_diagnostics_for_prompt(
+                    provider,
+                    buffer_to_paint,
+                    prompt,
+                    prompt_edit_mode,
+                    use_ansi_coloring,
+                )
+            } else {
+                String::new()
+            }
+        };
         #[cfg(not(feature = "lsp_diagnostics"))]
         let diagnostic_display = String::new();
 
@@ -2031,8 +2029,6 @@ impl Reedline {
         }
 
         let menu = self.menus.iter().find(|menu| menu.is_active());
-
-        
 
         self.painter.repaint_buffer(
             prompt,
@@ -2133,45 +2129,6 @@ impl Reedline {
         self
     }
 
-    /// Format diagnostic messages for display below the prompt.
-    ///
-    /// Renders diagnostics with vertical connecting lines and handlebars spanning the diagnostic:
-    /// ```text
-    /// ╎ ╰────╯ Unnecessary '^' prefix on external command 'head'
-    /// ╰ Use 'first N' to get the first N items
-    /// ```
-    #[cfg(feature = "lsp_diagnostics")]
-    fn format_diagnostic_messages(&mut self, prompt: &dyn Prompt) -> String {
-        // Get diagnostics - need to clone to avoid borrow issues
-        let diagnostics: Vec<_> = self
-            .lsp_diagnostics
-            .as_mut()
-            .map(|p| p.diagnostics().to_vec())
-            .unwrap_or_default();
-
-        if diagnostics.is_empty() {
-            return String::new();
-        }
-
-        let buffer = self.editor.get_buffer();
-
-        // Calculate prompt width (last line of prompt + indicator)
-        // Strip ANSI escape sequences before measuring - they have no visual width
-        let prompt_left = prompt.render_prompt_left();
-        let prompt_indicator = prompt.render_prompt_indicator(self.prompt_edit_mode());
-        let last_prompt_line = prompt_left.lines().last().unwrap_or("");
-        let prompt_width =
-            unicode_width::UnicodeWidthStr::width(strip_ansi(last_prompt_line).as_str())
-                + unicode_width::UnicodeWidthStr::width(strip_ansi(&prompt_indicator).as_str());
-
-        crate::lsp::format_diagnostic_messages(
-            &diagnostics,
-            buffer,
-            prompt_width,
-            self.use_ansi_coloring,
-        )
-    }
-
     /// Open the diagnostic fix menu with available fixes at the cursor position.
     ///
     /// This requests code actions from the LSP server for diagnostics at the
@@ -2180,9 +2137,6 @@ impl Reedline {
     /// Returns `true` if the menu was opened, `false` if there were no fixes.
     #[cfg(feature = "lsp_diagnostics")]
     fn open_diagnostic_fix_menu(&mut self) -> bool {
-        use crate::lsp::{range_to_span, Span};
-        use crate::menu::DiagnosticFixMenu;
-
         let Some(ref mut provider) = self.lsp_diagnostics else {
             return false;
         };
@@ -2190,50 +2144,17 @@ impl Reedline {
         let cursor_pos = self.editor.insertion_point();
         let content = self.editor.get_buffer();
 
-        // Find diagnostics at cursor position to determine the span for code actions
-        let diagnostic_span = provider
-            .diagnostics()
-            .iter()
-            .find(|d| {
-                let span = range_to_span(content, &d.range);
-                span.start <= cursor_pos && cursor_pos <= span.end
-            })
-            .map(|d| range_to_span(content, &d.range));
-
-        let span = match diagnostic_span {
-            Some(s) => s,
-            None => {
-                // No diagnostic at cursor, use cursor position as a point
-                Span::new(cursor_pos, cursor_pos)
-            }
-        };
-
-        // Request code actions from the LSP server
-        let code_actions = provider.code_actions(content, span);
-
-        if code_actions.is_empty() {
-            return false;
-        }
-
-        // Calculate the anchor column based on the span start
-        use unicode_width::UnicodeWidthStr;
-        let anchor_col = if span.start <= content.len() {
-            content[..span.start].width() as u16
-        } else {
-            0
-        };
-
         // Remove any existing diagnostic fix menu
         let menu_name = "diagnostic_fix_menu";
         self.menus.retain(|m| m.name() != menu_name);
 
-        // Create a new menu with fixes, positioned at the start of the diagnostic span
-        let mut fix_menu = DiagnosticFixMenu::default();
-        fix_menu.set_fixes(code_actions, content, anchor_col);
-        let mut menu = ReedlineMenu::EngineCompleter(Box::new(fix_menu));
-        menu.menu_event(MenuEvent::Activate(false));
-        self.menus.push(menu);
-        true
+        // Create the menu using the integration helper
+        if let Some(menu) = crate::lsp::create_diagnostic_fix_menu(provider, cursor_pos, content) {
+            self.menus.push(menu);
+            true
+        } else {
+            false
+        }
     }
 
     #[cfg(feature = "external_printer")]
