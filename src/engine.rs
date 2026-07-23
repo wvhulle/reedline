@@ -3370,6 +3370,9 @@ impl Reedline {
         let mut styled_text = self
             .highlighter
             .highlight(buffer_to_paint, cursor_position_in_buffer);
+        if self.hide_hints {
+            styled_text.clear_underline_colors();
+        }
         if let Some((from, to)) = self.editor.get_selection() {
             // With a cursor-cell style configured, the head cell gets it and
             // the selection style covers the rest of the range.

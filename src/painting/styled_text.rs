@@ -1,4 +1,4 @@
-use nu_ansi_term::Style;
+use nu_ansi_term::{Color, Style};
 
 use crate::core_editor::{ensure_grapheme_boundary_next, ensure_grapheme_boundary_prev};
 use crate::terminal_extensions::semantic_prompt::{PromptKind, SemanticPromptMarkers};
@@ -11,6 +11,15 @@ use super::utils::{escape_control, strip_ansi};
 pub struct StyledText {
     /// The component, styled parts of the text
     pub buffer: Vec<(Style, String)>,
+    underline_colors: Vec<UnderlineColorRange>,
+}
+
+#[derive(Clone, Copy)]
+struct UnderlineColorRange {
+    start: usize,
+    end: usize,
+    color: Color,
+    severity_rank: u32,
 }
 
 impl Default for StyledText {
@@ -22,7 +31,10 @@ impl Default for StyledText {
 impl StyledText {
     /// Construct a new `StyledText`
     pub const fn new() -> Self {
-        Self { buffer: vec![] }
+        Self {
+            buffer: vec![],
+            underline_colors: vec![],
+        }
     }
 
     /// Add a new styled string to the buffer
@@ -66,6 +78,26 @@ impl StyledText {
         self.buffer = rebuilt;
     }
 
+    /// Underline `from..to` with a colored curly line. Where ranges overlap, the lowest `severity_rank` wins.
+    pub fn set_underline_color_range(
+        &mut self,
+        from: usize,
+        to: usize,
+        color: Color,
+        severity_rank: u32,
+    ) {
+        self.underline_colors.push(UnderlineColorRange {
+            start: from,
+            end: to,
+            color,
+            severity_rank,
+        });
+    }
+
+    pub(crate) fn clear_underline_colors(&mut self) {
+        self.underline_colors.clear();
+    }
+
     /// Render the styled string. We use the insertion point to render around so that
     /// we can properly write out the styled string to the screen and find the correct
     /// place to put the cursor. This assumes a logic that prints the first part of the
@@ -88,40 +120,57 @@ impl StyledText {
         let prompt_style = Style::new().fg(prompt.get_prompt_multiline_color());
 
         for pair in &self.buffer {
+            let seg_len = pair.1.len();
             if current_idx >= insertion_point {
-                right_string.push_str(&render_as_string(
-                    pair,
-                    &prompt_style,
-                    &multiline_prompt,
-                    semantic_markers,
+                let rendered =
+                    render_as_string(pair, &prompt_style, &multiline_prompt, semantic_markers);
+                right_string.push_str(&wrap_underline_color(
+                    &rendered,
+                    current_idx,
+                    seg_len,
+                    &self.underline_colors,
                 ));
-            } else if pair.1.len() + current_idx <= insertion_point {
-                left_string.push_str(&render_as_string(
-                    pair,
-                    &prompt_style,
-                    &multiline_prompt,
-                    semantic_markers,
+            } else if seg_len + current_idx <= insertion_point {
+                let rendered =
+                    render_as_string(pair, &prompt_style, &multiline_prompt, semantic_markers);
+                left_string.push_str(&wrap_underline_color(
+                    &rendered,
+                    current_idx,
+                    seg_len,
+                    &self.underline_colors,
                 ));
-            } else if pair.1.len() + current_idx > insertion_point {
+            } else if seg_len + current_idx > insertion_point {
                 let offset = insertion_point - current_idx;
 
                 let left_side = pair.1[..offset].to_string();
                 let right_side = pair.1[offset..].to_string();
 
-                left_string.push_str(&render_as_string(
+                let left_rendered = render_as_string(
                     &(pair.0, left_side),
                     &prompt_style,
                     &multiline_prompt,
                     semantic_markers,
+                );
+                left_string.push_str(&wrap_underline_color(
+                    &left_rendered,
+                    current_idx,
+                    offset,
+                    &self.underline_colors,
                 ));
-                right_string.push_str(&render_as_string(
+                let right_rendered = render_as_string(
                     &(pair.0, right_side),
                     &prompt_style,
                     &multiline_prompt,
                     semantic_markers,
+                );
+                right_string.push_str(&wrap_underline_color(
+                    &right_rendered,
+                    current_idx + offset,
+                    seg_len - offset,
+                    &self.underline_colors,
                 ));
             }
-            current_idx += pair.1.len();
+            current_idx += seg_len;
         }
 
         if use_ansi_coloring {
@@ -133,9 +182,16 @@ impl StyledText {
 
     /// Apply the ANSI style formatting to the full string.
     pub fn render_simple(&self) -> String {
+        let mut current_idx = 0;
         self.buffer
             .iter()
-            .map(|(style, text)| style.paint(escape_control(text)).to_string())
+            .map(|(style, text)| {
+                let painted = style.paint(escape_control(text)).to_string();
+                let result =
+                    wrap_underline_color(&painted, current_idx, text.len(), &self.underline_colors);
+                current_idx += text.len();
+                result
+            })
             .collect()
     }
 
@@ -256,6 +312,56 @@ fn render_as_string(
     rendered
 }
 
+fn wrap_underline_color(
+    painted: &str,
+    byte_offset: usize,
+    len: usize,
+    ranges: &[UnderlineColorRange],
+) -> String {
+    if len == 0 {
+        return painted.to_string();
+    }
+    let seg_end = byte_offset + len;
+    let color = ranges
+        .iter()
+        .filter(|range| byte_offset < range.end && seg_end > range.start)
+        .min_by_key(|range| range.severity_rank)
+        .map(|range| range.color);
+    match color {
+        Some(c) => {
+            let set = format!("\x1b[4:3m{}", underline_color_escape(c));
+            let reset = "\x1b[24m\x1b[59m";
+            format!("{set}{painted}{reset}")
+        }
+        None => painted.to_string(),
+    }
+}
+
+/// Build the SGR 58 escape sequence for a [`Color`].
+fn underline_color_escape(color: Color) -> String {
+    match color {
+        Color::Black => "\x1b[58;5;0m".into(),
+        Color::Red => "\x1b[58;5;1m".into(),
+        Color::Green => "\x1b[58;5;2m".into(),
+        Color::Yellow => "\x1b[58;5;3m".into(),
+        Color::Blue => "\x1b[58;5;4m".into(),
+        Color::Purple | Color::Magenta => "\x1b[58;5;5m".into(),
+        Color::Cyan => "\x1b[58;5;6m".into(),
+        Color::White => "\x1b[58;5;7m".into(),
+        Color::DarkGray => "\x1b[58;5;8m".into(),
+        Color::LightRed => "\x1b[58;5;9m".into(),
+        Color::LightGreen => "\x1b[58;5;10m".into(),
+        Color::LightYellow => "\x1b[58;5;11m".into(),
+        Color::LightBlue => "\x1b[58;5;12m".into(),
+        Color::LightPurple | Color::LightMagenta => "\x1b[58;5;13m".into(),
+        Color::LightCyan => "\x1b[58;5;14m".into(),
+        Color::LightGray => "\x1b[58;5;15m".into(),
+        Color::Fixed(n) => format!("\x1b[58;5;{n}m"),
+        Color::Rgb(r, g, b) => format!("\x1b[58;2;{r};{g};{b}m"),
+        Color::Default => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod test {
     use nu_ansi_term::{Color, Style};
@@ -269,6 +375,7 @@ mod test {
         let after_style = Style::new().on(Color::Red);
         (
             super::StyledText {
+                underline_colors: vec![],
                 buffer: vec![
                     (before_style, "aaa".into()),
                     (before_style, "bbb".into()),
@@ -324,6 +431,7 @@ mod test {
     fn style_range_last_letter() {
         let (_, before_style, after_style) = get_styled_text_template();
         let mut styled_text = StyledText {
+            underline_colors: vec![],
             buffer: vec![(before_style, "asdf".into())],
         };
         styled_text.style_range(3, 4, after_style);
@@ -334,6 +442,7 @@ mod test {
     fn style_range_from_second_to_last() {
         let (_, before_style, after_style) = get_styled_text_template();
         let mut styled_text = StyledText {
+            underline_colors: vec![],
             buffer: vec![(before_style, "asdf".into())],
         };
         styled_text.style_range(2, 3, after_style);
@@ -390,6 +499,7 @@ mod test {
         let (_, before_style, after_style) = get_styled_text_template();
         let mut styled = StyledText {
             buffer: vec![(before_style, text.into())],
+            underline_colors: vec![],
         };
         styled.style_range(from, to, after_style);
         // Whatever the split policy, the text itself must survive intact.
@@ -400,6 +510,7 @@ mod test {
     fn regression_style_range_cargo_run() {
         let (_, before_style, after_style) = get_styled_text_template();
         let mut styled_text = StyledText {
+            underline_colors: vec![],
             buffer: vec![
                 (before_style, "cargo".into()),
                 (before_style, " ".into()),
@@ -487,6 +598,7 @@ mod test {
         let sel = Style::new().on(Color::LightGray);
         let mut styled = StyledText {
             buffer: vec![(Style::new(), "ab\ncd".into())],
+            underline_colors: vec![],
         };
         styled.style_range(2, 3, sel);
         let (left, right) =
@@ -514,6 +626,7 @@ mod test {
         // still get no cell.
         let mut styled = StyledText {
             buffer: vec![(Style::new(), "ab\ncd".into())],
+            underline_colors: vec![],
         };
         styled.style_range(1, 4, style);
         let rendered: String = styled
@@ -643,6 +756,7 @@ mod test {
         let sel = Style::new().on(Color::LightGray);
         let mut styled = StyledText {
             buffer: vec![(Style::new(), "ab\ncd".into())],
+            underline_colors: vec![],
         };
         styled.style_range(2, 3, sel);
         assert_eq!(styled.buffer[1], (sel, "\n".into()));
