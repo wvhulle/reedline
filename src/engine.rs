@@ -3,6 +3,8 @@ use std::{collections::HashMap, ops::ControlFlow, path::PathBuf};
 use itertools::Itertools;
 use nu_ansi_term::{Color, Style};
 
+#[cfg(feature = "lsp_diagnostics")]
+use crate::lsp::LspDiagnosticsProvider;
 use crate::{enums::ReedlineRawEvent, CursorConfig};
 #[cfg(feature = "bashisms")]
 use crate::{
@@ -228,6 +230,8 @@ pub struct Reedline {
     // Useful for processing external events (e.g., GUI updates) during idle time.
     #[cfg(feature = "idle_callback")]
     idle_callback: Option<Box<dyn FnMut() + Send>>,
+    #[cfg(feature = "lsp_diagnostics")]
+    pub(crate) lsp_providers: Vec<LspDiagnosticsProvider>,
 }
 
 struct BufferEditor {
@@ -334,6 +338,8 @@ impl Reedline {
             external_printer: None,
             #[cfg(feature = "idle_callback")]
             idle_callback: None,
+            #[cfg(feature = "lsp_diagnostics")]
+            lsp_providers: Vec::new(),
         }
     }
 
@@ -907,6 +913,11 @@ impl Reedline {
             poll |= self.idle_callback.is_some();
         }
 
+        #[cfg(feature = "lsp_diagnostics")]
+        {
+            poll |= self.needs_lsp_polling();
+        }
+
         poll
     }
 
@@ -1110,6 +1121,12 @@ impl Reedline {
                 }
             }
         }
+        // A pending LSP message (diagnostics arriving between keystrokes) wakes
+        // the loop without an input event; repaint so new underlines/hints show.
+        #[cfg(feature = "lsp_diagnostics")]
+        if self.check_lsp_wake() {
+            need_repaint = true;
+        }
         // A command-less mode transition adopts a new rest policy via
         // `sync_edit_mode` but emits nothing to commit the cursor. Force the
         // settle (and a repaint) so it doesn't stay unsettled until the next
@@ -1257,6 +1274,8 @@ impl Reedline {
             | ReedlineEvent::MenuPageNext
             | ReedlineEvent::MenuPagePrevious
             | ReedlineEvent::ViChangeMode(_) => Ok(EventStatus::Inapplicable),
+            #[cfg(feature = "lsp_diagnostics")]
+            ReedlineEvent::OpenDiagnosticFixMenu => Ok(EventStatus::Inapplicable),
         }
     }
 
@@ -1412,6 +1431,14 @@ impl Reedline {
                 for menu in self.menus.iter_mut() {
                     if menu.is_active() {
                         menu.replace_in_buffer(&mut self.editor);
+
+                        #[cfg(feature = "lsp_diagnostics")]
+                        if let Some(cmd) = menu.take_pending_command() {
+                            if let Some(provider) = self.lsp_providers.get_mut(cmd.provider_idx) {
+                                provider.execute_command(&cmd.command, cmd.arguments);
+                            }
+                        }
+
                         menu.menu_event(MenuEvent::Deactivate);
 
                         return Ok(EventStatus::Handled);
@@ -1615,6 +1642,7 @@ impl Reedline {
                 Ok(EventStatus::Inapplicable)
             }
             ReedlineEvent::ViChangeMode(_) => Ok(self.edit_mode.handle_mode_specific_event(event)),
+
             ReedlineEvent::Mouse {
                 column,
                 row,
@@ -1624,6 +1652,15 @@ impl Reedline {
                     self.handle_mouse_click(column, row)?;
                 }
                 Ok(EventStatus::Handled)
+            }
+
+            #[cfg(feature = "lsp_diagnostics")]
+            ReedlineEvent::OpenDiagnosticFixMenu => {
+                if self.open_diagnostic_fix_menu() {
+                    Ok(EventStatus::Handled)
+                } else {
+                    Ok(EventStatus::Inapplicable)
+                }
             }
             ReedlineEvent::None => Ok(EventStatus::Inapplicable),
         }
@@ -2234,6 +2271,7 @@ impl Reedline {
                 &res_string,
                 "",
                 "",
+                "",
             );
 
             self.painter.repaint_buffer(
@@ -2243,6 +2281,7 @@ impl Reedline {
                 None,
                 self.use_ansi_coloring,
                 &self.cursor_shapes,
+                Some(self.highlighter.as_ref()),
             )?;
         }
 
@@ -2256,9 +2295,25 @@ impl Reedline {
         let cursor_position_in_buffer = self.editor.insertion_point();
         let buffer_to_paint = self.editor.get_buffer();
 
+        // Update LSP diagnostics with current buffer content
+        #[cfg(feature = "lsp_diagnostics")]
+        for provider in &mut self.lsp_providers {
+            provider.update_content(buffer_to_paint);
+        }
+
         let mut styled_text = self
             .highlighter
             .highlight(buffer_to_paint, cursor_position_in_buffer);
+
+        #[cfg(feature = "lsp_diagnostics")]
+        if !self.hide_hints {
+            crate::lsp::apply_diagnostic_underlines(
+                &mut styled_text,
+                &mut self.lsp_providers,
+                buffer_to_paint,
+            );
+        }
+
         if let Some((from, to)) = self.editor.get_selection() {
             styled_text.style_range(from, to, self.visual_selection_style);
         }
@@ -2292,6 +2347,29 @@ impl Reedline {
         // Needs to add return carriage to newlines because when not in raw mode
         // some OS don't fully return the carriage
 
+        // Format diagnostic messages for display below the prompt.
+        // Skip during submit (hide_hints == true) to avoid orphaned lines on the terminal.
+        #[cfg(feature = "lsp_diagnostics")]
+        let diagnostic_display = if !self.hide_hints {
+            let use_ansi_coloring = self.use_ansi_coloring;
+            self.lsp_providers
+                .iter_mut()
+                .map(|provider| {
+                    crate::lsp::format_diagnostics_for_prompt(
+                        provider,
+                        self.painter.screen_width() as usize,
+                        use_ansi_coloring,
+                    )
+                })
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
+        #[cfg(not(feature = "lsp_diagnostics"))]
+        let diagnostic_display = String::new();
+
         let mut lines = PromptLines::new(
             prompt,
             self.prompt_edit_mode(),
@@ -2299,6 +2377,7 @@ impl Reedline {
             &before_cursor,
             &after_cursor,
             &hint,
+            &diagnostic_display,
         );
 
         // Updating the working details of the active menu
@@ -2327,6 +2406,7 @@ impl Reedline {
             menu,
             self.use_ansi_coloring,
             &self.cursor_shapes,
+            Some(self.highlighter.as_ref()),
         )?;
 
         if self.mouse_click_mode.is_enabled() {
@@ -2406,6 +2486,59 @@ impl Reedline {
     pub fn with_idle_callback(mut self, callback: Box<dyn FnMut() + Send>) -> Self {
         self.idle_callback = Some(callback);
         self
+    }
+
+    /// Adds an LSP diagnostics provider for real-time inline diagnostics.
+    ///
+    /// ## Required feature:
+    /// `lsp_diagnostics`
+    #[cfg(feature = "lsp_diagnostics")]
+    pub fn with_lsp_diagnostics(mut self, provider: LspDiagnosticsProvider) -> Self {
+        self.lsp_providers.push(provider);
+        self
+    }
+
+    /// Remove all LSP diagnostics providers.
+    ///
+    /// Call this before re-adding providers in a loop to prevent accumulation.
+    ///
+    /// ## Required feature:
+    /// `lsp_diagnostics`
+    #[cfg(feature = "lsp_diagnostics")]
+    pub fn clear_lsp_providers(&mut self) {
+        self.lsp_providers.clear();
+    }
+
+    /// Open the diagnostic fix menu with available fixes at the cursor position.
+    ///
+    /// This requests code actions from the LSP server for diagnostics at the
+    /// cursor position and displays them in a menu.
+    ///
+    /// Returns `true` if the menu was opened, `false` if there were no fixes.
+    #[cfg(feature = "lsp_diagnostics")]
+    fn open_diagnostic_fix_menu(&mut self) -> bool {
+        if self.lsp_providers.is_empty() {
+            return false;
+        }
+
+        let cursor_pos = self.editor.insertion_point();
+        let content = self.editor.get_buffer();
+
+        // Remove any existing diagnostic fix menu
+        let menu_name = "diagnostic_fix_menu";
+        self.menus.retain(|m| m.name() != menu_name);
+
+        // Collect code actions from all providers that have a diagnostic at the cursor
+        if let Some(menu) = crate::lsp::create_diagnostic_fix_menu(
+            &mut self.lsp_providers,
+            cursor_pos,
+            content,
+            Some(self.highlighter.as_ref()),
+        ) {
+            self.menus.push(menu);
+            return true;
+        }
+        false
     }
 
     #[cfg(feature = "external_printer")]

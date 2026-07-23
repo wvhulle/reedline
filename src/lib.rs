@@ -286,7 +286,17 @@ pub use hinter::{DefaultHinter, Hinter};
 mod validator;
 pub use validator::{DefaultValidator, ValidationResult, Validator};
 
+#[cfg(feature = "lsp_diagnostics")]
+mod lsp;
+#[cfg(feature = "lsp_diagnostics")]
+pub use lsp::{
+    CodeAction, Diagnostic, DiagnosticSeverity, LspConfig, LspDiagnosticsProvider,
+    ByteBufferSpan as DiagnosticSpan, TextEdit,
+};
+
 mod menu;
+#[cfg(feature = "lsp_diagnostics")]
+pub use menu::DiagnosticFixMenu;
 pub use menu::{
     menu_functions, ColumnarMenu, DescriptionMenu, DescriptionMode, DescriptionPosition, IdeMenu,
     InputMode, ListMenu, Menu, MenuBuilder, MenuEvent, MenuTextStyle, OutputMode, ReedlineMenu,

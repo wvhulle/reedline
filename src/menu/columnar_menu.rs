@@ -660,7 +660,7 @@ impl Menu for ColumnarMenu {
     }
 
     /// The buffer gets replaced in the Span location
-    fn replace_in_buffer(&self, editor: &mut Editor) {
+    fn replace_in_buffer(&mut self, editor: &mut Editor) {
         replace_in_buffer(self.get_value(), editor, self.settings.output_mode);
     }
 

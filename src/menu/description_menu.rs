@@ -580,7 +580,7 @@ impl Menu for DescriptionMenu {
     }
 
     /// The buffer gets replaced in the Span location
-    fn replace_in_buffer(&self, editor: &mut Editor) {
+    fn replace_in_buffer(&mut self, editor: &mut Editor) {
         if let Some(mut suggestion) = self.get_value() {
             if let Some(example_index) = self.example_index {
                 let example = self

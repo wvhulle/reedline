@@ -1,0 +1,450 @@
+//! Menu for displaying and applying diagnostic fixes.
+//!
+//! This menu shows available code fixes for diagnostics at the cursor position,
+//! with a simple inline format: replacement text followed by title in parentheses.
+//! The menu is positioned below the text being replaced, aligned with the anchor column.
+
+use async_lsp::lsp_types::{CodeAction, Range, TextEdit};
+use itertools::Itertools;
+use nu_ansi_term::{ansi::RESET, Style};
+use serde_json::Value;
+
+use super::{Menu, MenuBuilder, MenuEvent, MenuSettings};
+use crate::Highlighter;
+use crate::{
+    core_editor::Editor,
+    lsp::ByteBufferSpan,
+    painting::Painter,
+    Completer, Suggestion, UndoBehavior,
+};
+
+/// A deferred LSP command to be dispatched by the engine.
+///
+/// The menu cannot execute LSP commands directly because it does not own the
+/// provider. Instead it returns this struct so the engine can dispatch it to
+/// the correct `LspDiagnosticsProvider` by index.
+#[derive(Debug, Clone)]
+pub struct PendingLspCommand {
+    /// Index into `Reedline::lsp_providers`.
+    pub provider_idx: usize,
+    /// The LSP `workspace/executeCommand` method name.
+    pub command: String,
+    /// Arguments for the command.
+    pub arguments: Vec<serde_json::Value>,
+}
+
+/// A single text edit with span, original, and replacement.
+#[derive(Debug, Clone)]
+pub struct TextEditInfo {
+    /// Byte span in the buffer
+    pub span: ByteBufferSpan,
+    /// Original text at this span
+    pub original: String,
+    /// Pre-highlighted ANSI string of original with strikethrough
+    pub original_styled: String,
+    /// Replacement text (empty for deletions)
+    pub replacement: String,
+    /// Pre-highlighted ANSI string for display
+    pub replacement_styled: String,
+}
+
+/// The action to perform for a fix.
+#[derive(Debug, Clone)]
+pub enum FixAction {
+    /// Text edits to apply to the buffer
+    TextEdits(Vec<TextEditInfo>),
+    /// LSP command to execute on the server
+    Command {
+        provider_idx: usize,
+        command: String,
+        arguments: Vec<Value>,
+    },
+}
+
+/// Pre-computed fix with byte offsets for buffer manipulation.
+#[derive(Debug, Clone)]
+struct FixInfo {
+    /// Title of the fix (shown in the menu)
+    title: String,
+    /// The action to perform
+    action: FixAction,
+}
+
+/// Menu for displaying and applying diagnostic fixes.
+///
+/// Shows fix options as simple lines: `>replacement_text (title)`
+pub struct DiagnosticFixMenu {
+    /// Menu settings (name, color, etc.)
+    settings: MenuSettings,
+    /// Whether the menu is active
+    active: bool,
+    /// Available fixes with pre-computed byte offsets
+    fixes: Vec<FixInfo>,
+    /// Selected index
+    selected: usize,
+    /// Number of values to skip for scrolling
+    skip_values: usize,
+    /// Max height of the menu
+    max_height: u16,
+    /// Pending LSP command to be dispatched by the engine after menu deactivation.
+    pending_command: Option<PendingLspCommand>,
+}
+
+impl Default for DiagnosticFixMenu {
+    fn default() -> Self {
+        Self {
+            settings: MenuSettings::default().with_name("diagnostic_fix_menu"),
+            active: false,
+            fixes: Vec::new(),
+            selected: 0,
+            skip_values: 0,
+            max_height: 10,
+            pending_command: None,
+        }
+    }
+}
+
+impl MenuBuilder for DiagnosticFixMenu {
+    fn settings_mut(&mut self) -> &mut MenuSettings {
+        &mut self.settings
+    }
+}
+
+impl DiagnosticFixMenu {
+    /// Update the available fixes from LSP code actions.
+    ///
+    /// Each action is paired with its provider index so that command-based
+    /// actions can be dispatched to the correct `LspDiagnosticsProvider`.
+    ///
+    /// Converts LSP ranges to byte offsets using the provided content.
+    /// Supports both edit-based and command-based actions.
+    ///
+    /// When a highlighter is provided, replacement and original text are pre-highlighted
+    /// at setup time, avoiding repeated highlighting work on each render pass.
+    pub fn set_fixes(
+        &mut self,
+        actions: Vec<(usize, CodeAction)>,
+        content: &str,
+        highlighter: Option<&dyn Highlighter>,
+    ) {
+        self.fixes = actions
+            .into_iter()
+            .filter_map(|(provider_idx, action)| {
+                // Try edit-based action first
+                if let Some(edits) = extract_text_edits(&action) {
+                    let edits: Vec<TextEditInfo> = edits
+                        .into_iter()
+                        .map(|edit| {
+                            let span = {
+                                let range: &Range = &edit.range;
+                                ByteBufferSpan::from_range(content, range)
+                            };
+                            let original =
+                                content.get(span.start..span.end).unwrap_or("").to_string();
+                            let replacement = edit.new_text;
+
+                            let original_styled = if let Some(h) = highlighter {
+                                let mut styled = h.highlight(&original, original.len());
+                                styled.transform_style_range(0, original.len(), |s| {
+                                    s.strikethrough()
+                                });
+                                styled.render_simple()
+                            } else {
+                                let style = Style::new().strikethrough();
+                                format!("{}{}{}", style.prefix(), original, style.suffix())
+                            };
+
+                            let replacement_styled = if let Some(h) = highlighter {
+                                h.highlight(&replacement, replacement.len()).render_simple()
+                            } else {
+                                replacement.clone()
+                            };
+
+                            TextEditInfo {
+                                span,
+                                original,
+                                original_styled,
+                                replacement,
+                                replacement_styled,
+                            }
+                        })
+                        .collect();
+
+                    if !edits.is_empty() {
+                        return Some(FixInfo {
+                            title: action.title,
+                            action: FixAction::TextEdits(edits),
+                        });
+                    }
+                }
+
+                // Fall back to command-based action
+                if let Some(cmd) = action.command {
+                    return Some(FixInfo {
+                        title: action.title,
+                        action: FixAction::Command {
+                            provider_idx,
+                            command: cmd.command,
+                            arguments: cmd.arguments.unwrap_or_default(),
+                        },
+                    });
+                }
+
+                None
+            })
+            .collect();
+
+        self.selected = 0;
+        self.skip_values = 0;
+    }
+
+    /// Check if there are any fixes available.
+    pub fn has_fixes(&self) -> bool {
+        !self.fixes.is_empty()
+    }
+
+    /// Get the currently selected fix.
+    fn get_selected_fix(&self) -> Option<&FixInfo> {
+        self.fixes.get(self.selected)
+    }
+
+    /// Format a single fix line using pre-computed styled text.
+    fn format_fix_line(&self, fix: &FixInfo, index: usize, use_ansi_coloring: bool) -> String {
+        let is_selected = index == self.selected;
+        let indicator = if is_selected { "> " } else { "  " };
+
+        let title_style = if use_ansi_coloring {
+            Style::new().italic()
+        } else {
+            Style::new()
+        };
+
+        match &fix.action {
+            FixAction::TextEdits(edits) => {
+                let first_edit = edits.first();
+                let replacement_text = first_edit.map_or("", |e| e.replacement.as_str());
+
+                if edits.len() > 1 {
+                    format!("{indicator}{}{}{RESET}", title_style.prefix(), fix.title)
+                } else if replacement_text.is_empty() {
+                    // Deletion: show strikethrough original
+                    let orig = if use_ansi_coloring {
+                        first_edit.map_or(String::new(), |e| e.original_styled.clone())
+                    } else {
+                        first_edit.map_or(String::new(), |e| e.original.clone())
+                    };
+                    format!("{indicator}{orig}{RESET}")
+                } else {
+                    // Replacement: show original -> replacement
+                    let orig = if use_ansi_coloring {
+                        first_edit.map_or(String::new(), |e| e.original_styled.clone())
+                    } else {
+                        first_edit.map_or(String::new(), |e| e.original.clone())
+                    };
+                    let repl = if use_ansi_coloring {
+                        first_edit.map_or(String::new(), |e| e.replacement_styled.clone())
+                    } else {
+                        first_edit.map_or(String::new(), |e| e.replacement.clone())
+                    };
+                    format!("{indicator}{orig} → {repl}{RESET}")
+                }
+            }
+            FixAction::Command { .. } => {
+                format!("{indicator}{}{}{RESET}", title_style.prefix(), fix.title)
+            }
+        }
+    }
+
+    /// Move selection forward, wrapping around
+    fn select_next(&mut self) {
+        if self.fixes.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1) % self.fixes.len();
+        self.adjust_scroll_forward();
+    }
+
+    /// Move selection backward, wrapping around
+    fn select_previous(&mut self) {
+        if self.fixes.is_empty() {
+            return;
+        }
+        self.selected = self.selected.checked_sub(1).unwrap_or(self.fixes.len() - 1);
+        self.adjust_scroll_backward();
+    }
+
+    /// Adjust scroll position when moving forward
+    fn adjust_scroll_forward(&mut self) {
+        let visible_items = self.max_height as usize;
+        if self.selected >= self.skip_values + visible_items {
+            self.skip_values = self.selected.saturating_sub(visible_items - 1);
+        } else if self.selected < self.skip_values {
+            self.skip_values = self.selected;
+        }
+    }
+
+    /// Adjust scroll position when moving backward
+    fn adjust_scroll_backward(&mut self) {
+        if self.selected < self.skip_values {
+            self.skip_values = self.selected;
+        }
+    }
+}
+
+/// Extract text edits from a code action's workspace edit.
+fn extract_text_edits(action: &CodeAction) -> Option<Vec<TextEdit>> {
+    action
+        .edit
+        .as_ref()?
+        .changes
+        .as_ref()?
+        .values()
+        .next()
+        .cloned()
+}
+
+impl Menu for DiagnosticFixMenu {
+    fn settings(&self) -> &MenuSettings {
+        &self.settings
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn can_quick_complete(&self) -> bool {
+        true
+    }
+
+    fn can_partially_complete(
+        &mut self,
+        _values_updated: bool,
+        _editor: &mut Editor,
+        _completer: &mut dyn Completer,
+    ) -> bool {
+        false
+    }
+
+    fn menu_event(&mut self, event: MenuEvent) {
+        match event {
+            MenuEvent::Activate(_) => {
+                self.active = true;
+                self.selected = 0;
+                self.skip_values = 0;
+            }
+            MenuEvent::Deactivate => self.active = false,
+            // Handle both NextElement (Tab) and MoveDown (arrow key)
+            MenuEvent::NextElement | MenuEvent::MoveDown => self.select_next(),
+            // Handle both PreviousElement (Shift+Tab) and MoveUp (arrow key)
+            MenuEvent::PreviousElement | MenuEvent::MoveUp => self.select_previous(),
+            _ => {}
+        }
+    }
+
+    fn update_values(&mut self, _editor: &mut Editor, _completer: &mut dyn Completer) {
+        // Fixes are set via set_fixes(), nothing to update from completer
+    }
+
+    fn reset_position(&mut self) {
+        self.selected = 0;
+        self.skip_values = 0;
+    }
+
+    fn update_working_details(
+        &mut self,
+        _editor: &mut Editor,
+        _completer: &mut dyn Completer,
+        _painter: &Painter,
+    ) {
+    }
+
+    fn replace_in_buffer(&mut self, editor: &mut Editor) {
+        let Some(fix) = self.get_selected_fix() else {
+            return;
+        };
+
+        match &fix.action {
+            FixAction::TextEdits(edits) => {
+                // Sort edits by start position descending to apply from end to start
+                let mut edits = edits.clone();
+                edits.sort_by_key(|e| std::cmp::Reverse(e.span.start));
+
+                let mut line_buffer = editor.line_buffer().clone();
+
+                // Apply all edits using fold
+                let new_buffer =
+                    edits
+                        .iter()
+                        .fold(line_buffer.get_buffer().to_string(), |mut buf, edit| {
+                            let start = edit.span.start.min(buf.len());
+                            let end = edit.span.end.min(buf.len());
+                            buf.replace_range(start..end, &edit.replacement);
+                            buf
+                        });
+
+                // Place cursor at end of first edit
+                let cursor_pos = edits
+                    .last() // After sorting descending, last is first original edit
+                    .map(|edit| edit.span.start + edit.replacement.len())
+                    .unwrap_or_else(|| line_buffer.insertion_point());
+
+                line_buffer.set_buffer(new_buffer);
+                line_buffer.set_insertion_point(cursor_pos.min(line_buffer.get_buffer().len()));
+                editor.set_line_buffer(line_buffer, UndoBehavior::CreateUndoPoint);
+            }
+            FixAction::Command { provider_idx, command, arguments } => {
+                self.pending_command = Some(PendingLspCommand {
+                    provider_idx: *provider_idx,
+                    command: command.clone(),
+                    arguments: arguments.clone(),
+                });
+            }
+        }
+    }
+
+    fn take_pending_command(&mut self) -> Option<PendingLspCommand> {
+        self.pending_command.take()
+    }
+
+    fn min_rows(&self) -> u16 {
+        self.fixes.len() as u16
+    }
+
+    fn get_values(&self) -> &[Suggestion] {
+        // Return empty - we don't use Suggestion directly
+        &[]
+    }
+
+    fn menu_required_lines(&self, _terminal_columns: u16) -> u16 {
+        (self.fixes.len() as u16).min(self.max_height)
+    }
+
+    fn menu_string(&self, available_lines: u16, use_ansi_coloring: bool) -> String {
+        self.menu_string_with_highlighter(available_lines, use_ansi_coloring, None)
+    }
+
+    fn menu_string_with_highlighter(
+        &self,
+        available_lines: u16,
+        use_ansi_coloring: bool,
+        _highlighter: Option<&dyn Highlighter>,
+    ) -> String {
+        // Note: highlighter parameter is ignored - text is pre-highlighted in set_fixes()
+        if self.fixes.is_empty() {
+            return String::from("No fixes available");
+        }
+
+        let visible_count = (available_lines.min(self.max_height)) as usize;
+
+        self.fixes
+            .iter()
+            .enumerate()
+            .skip(self.skip_values)
+            .take(visible_count)
+            .map(|(idx, fix)| self.format_fix_line(fix, idx, use_ansi_coloring))
+            .join("\r\n")
+    }
+
+    fn set_cursor_pos(&mut self, _pos: (u16, u16)) {
+    }
+}

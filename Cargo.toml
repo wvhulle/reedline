@@ -26,9 +26,14 @@ fd-lock = "4.0.2"
 itertools = "0.15.0"
 keybindings = { version = "0.0.2", optional = true }
 nu-ansi-term = "0.50.0"
+async-lsp = { version = "0.2", optional = true, default-features = false, features = ["omni-trait"] }
+async-process = { version = "2", optional = true }
+futures = { version = "0.3", optional = true, default-features = false, features = ["std", "async-await"] }
+tokio = { version = "1", optional = true, features = ["rt", "macros", "sync"] }
 rusqlite = { version = "0.40.1", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", optional = true }
+log = { version = "0.4", optional = true }
 strip-ansi-escapes = "0.2.0"
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.19"
@@ -37,6 +42,7 @@ unicode-segmentation = "1.13.3"
 unicode-width = "0.2"
 
 [dev-dependencies]
+env_logger = "0.11"
 gethostname = "1.1.0"
 pretty_assertions = "1.4.0"
 rstest = { version = "0.26.1", default-features = false }
@@ -48,6 +54,7 @@ bashisms = []
 external_printer = ["crossbeam"]
 idle_callback = []
 helix = ["keybindings"]
+lsp_diagnostics = ["serde_json", "log", "crossbeam", "async-lsp", "async-process", "futures", "tokio"]
 sqlite = ["rusqlite/bundled", "serde_json"]
 sqlite-dynlib = ["rusqlite", "serde_json"]
 system_clipboard = ["arboard"]
@@ -64,6 +71,14 @@ required-features = ["external_printer"]
 [[example]]
 name = "helix"
 required-features = ["helix"]
+
+[[example]]
+name = "lsp_diagnostics"
+required-features = ["lsp_diagnostics"]
+
+[[example]]
+name = "multi_lsp"
+required-features = ["lsp_diagnostics"]
 
 [package.metadata.docs.rs]
 # Whether to pass `--all-features` to Cargo (default: false)

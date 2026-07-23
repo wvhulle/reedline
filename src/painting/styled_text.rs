@@ -1,4 +1,4 @@
-use nu_ansi_term::Style;
+use nu_ansi_term::{Color, Style};
 
 use crate::terminal_extensions::semantic_prompt::{PromptKind, SemanticPromptMarkers};
 use crate::Prompt;
@@ -10,6 +10,9 @@ use super::utils::strip_ansi;
 pub struct StyledText {
     /// The component, styled parts of the text
     pub buffer: Vec<(Style, String)>,
+    /// Byte ranges with colored curly underlines (start, end, color, severity).
+    /// Lower severity values are more severe (1 = error, 4 = hint).
+    underline_colors: Vec<(usize, usize, Color, u32)>,
 }
 
 impl Default for StyledText {
@@ -21,7 +24,10 @@ impl Default for StyledText {
 impl StyledText {
     /// Construct a new `StyledText`
     pub const fn new() -> Self {
-        Self { buffer: vec![] }
+        Self {
+            buffer: vec![],
+            underline_colors: vec![],
+        }
     }
 
     /// Add a new styled string to the buffer
@@ -29,8 +35,18 @@ impl StyledText {
         self.buffer.push(styled_string);
     }
 
-    /// Style range with the provided style
+    /// Style range with the provided style (replaces existing style)
     pub fn style_range(&mut self, from: usize, to: usize, new_style: Style) {
+        self.transform_style_range(from, to, |_| new_style);
+    }
+
+    /// Transform styles in a range using the provided function.
+    /// Unlike `style_range` which replaces styles, this preserves and modifies existing styles.
+    /// Useful for adding attributes (like underline) while preserving colors.
+    pub fn transform_style_range<F>(&mut self, from: usize, to: usize, f: F)
+    where
+        F: Fn(Style) -> Style,
+    {
         let (from, to) = if from > to { (to, from) } else { (from, to) };
         let mut current_idx = 0;
         let mut pair_idx = 0;
@@ -60,7 +76,7 @@ impl StyledText {
                 (Position::Before, Position::After) => {
                     let mut in_range = pair.1.split_off(from - current_idx);
                     let after_range = in_range.split_off(to - from);
-                    let in_range = (new_style, in_range);
+                    let in_range = (f(pair.0), in_range);
                     let after_range = (pair.0, after_range);
                     self.buffer.insert(pair_idx + 1, in_range);
                     self.buffer.insert(pair_idx + 2, after_range);
@@ -68,19 +84,20 @@ impl StyledText {
                 }
                 (Position::Before, Position::In) => {
                     let in_range = pair.1.split_off(from - current_idx);
-                    pair_idx += 1; // Additional increment for the split pair, since the new insertion is already correctly styled and can be skipped next iteration
-                    self.buffer.insert(pair_idx, (new_style, in_range));
+                    let transformed_style = f(pair.0);
+                    pair_idx += 1;
+                    self.buffer.insert(pair_idx, (transformed_style, in_range));
                 }
                 (Position::In, Position::After) => {
                     let after_range = pair.1.split_off(to - current_idx);
                     let old_style = pair.0;
-                    pair.0 = new_style;
+                    pair.0 = f(old_style);
                     if !after_range.is_empty() {
                         self.buffer.insert(pair_idx + 1, (old_style, after_range));
                     }
                     break;
                 }
-                (Position::In, Position::In) => pair.0 = new_style,
+                (Position::In, Position::In) => pair.0 = f(pair.0),
 
                 (Position::After, _) => break,
                 _ => (),
@@ -88,6 +105,24 @@ impl StyledText {
             current_idx = end_idx;
             pair_idx += 1;
         }
+    }
+
+    /// Mark a byte range to be rendered with a colored curly underline.
+    ///
+    /// `severity` is a [`DiagnosticSeverity`](async_lsp::lsp_types::DiagnosticSeverity)
+    /// numeric value (1 = error … 4 = hint). Lower values are more severe and
+    /// win when ranges overlap.
+    ///
+    /// The underline color is emitted as raw ANSI (SGR 4:3 + SGR 58) at render
+    /// time, independently of `nu_ansi_term::Style`.
+    pub fn set_underline_color_range(
+        &mut self,
+        from: usize,
+        to: usize,
+        color: Color,
+        severity: u32,
+    ) {
+        self.underline_colors.push((from, to, color, severity));
     }
 
     /// Render the styled string. We use the insertion point to render around so that
@@ -112,40 +147,45 @@ impl StyledText {
         let prompt_style = Style::new().fg(prompt.get_prompt_multiline_color());
 
         for pair in &self.buffer {
+            let seg_len = pair.1.len();
             if current_idx >= insertion_point {
-                right_string.push_str(&render_as_string(
+                let rendered = render_as_string(
                     pair,
                     &prompt_style,
                     &multiline_prompt,
                     semantic_markers,
-                ));
-            } else if pair.1.len() + current_idx <= insertion_point {
-                left_string.push_str(&render_as_string(
+                );
+                right_string.push_str(&wrap_underline_color(&rendered, current_idx, seg_len, &self.underline_colors));
+            } else if seg_len + current_idx <= insertion_point {
+                let rendered = render_as_string(
                     pair,
                     &prompt_style,
                     &multiline_prompt,
                     semantic_markers,
-                ));
-            } else if pair.1.len() + current_idx > insertion_point {
+                );
+                left_string.push_str(&wrap_underline_color(&rendered, current_idx, seg_len, &self.underline_colors));
+            } else if seg_len + current_idx > insertion_point {
                 let offset = insertion_point - current_idx;
 
                 let left_side = pair.1[..offset].to_string();
                 let right_side = pair.1[offset..].to_string();
 
-                left_string.push_str(&render_as_string(
+                let left_rendered = render_as_string(
                     &(pair.0, left_side),
                     &prompt_style,
                     &multiline_prompt,
                     semantic_markers,
-                ));
-                right_string.push_str(&render_as_string(
+                );
+                left_string.push_str(&wrap_underline_color(&left_rendered, current_idx, offset, &self.underline_colors));
+                let right_rendered = render_as_string(
                     &(pair.0, right_side),
                     &prompt_style,
                     &multiline_prompt,
                     semantic_markers,
-                ));
+                );
+                right_string.push_str(&wrap_underline_color(&right_rendered, current_idx + offset, seg_len - offset, &self.underline_colors));
             }
-            current_idx += pair.1.len();
+            current_idx += seg_len;
         }
 
         if use_ansi_coloring {
@@ -157,9 +197,15 @@ impl StyledText {
 
     /// Apply the ANSI style formatting to the full string.
     pub fn render_simple(&self) -> String {
+        let mut current_idx = 0;
         self.buffer
             .iter()
-            .map(|(style, text)| style.paint(text).to_string())
+            .map(|(style, text)| {
+                let painted = style.paint(text.as_str()).to_string();
+                let result = wrap_underline_color(&painted, current_idx, text.len(), &self.underline_colors);
+                current_idx += text.len();
+                result
+            })
             .collect()
     }
 
@@ -200,6 +246,65 @@ fn render_as_string(
     rendered
 }
 
+/// If the segment at `byte_offset..byte_offset+len` overlaps with any
+/// underline-color range, wrap `painted` with raw ANSI for curly underline
+/// (SGR 4:3) and underline color (SGR 58), resetting afterwards (SGR 24 + 59).
+///
+/// When multiple ranges overlap, the most severe one wins (lowest severity
+/// number: 1 = error, 2 = warning, …).
+fn wrap_underline_color(
+    painted: &str,
+    byte_offset: usize,
+    len: usize,
+    ranges: &[(usize, usize, Color, u32)],
+) -> String {
+    if len == 0 {
+        return painted.to_string();
+    }
+    let seg_end = byte_offset + len;
+    // Pick the color of the most-severe overlapping range.
+    let color = ranges
+        .iter()
+        .filter(|(start, end, _, _)| byte_offset < *end && seg_end > *start)
+        .min_by_key(|(_, _, _, sev)| *sev)
+        .map(|(_, _, c, _)| *c);
+    match color {
+        Some(c) => {
+            // SGR 4:3 = curly underline, SGR 58;… = underline color
+            let set = format!("\x1b[4:3m{}", underline_color_escape(c));
+            // SGR 24 = underline off, SGR 59 = default underline color
+            let reset = "\x1b[24m\x1b[59m";
+            format!("{set}{painted}{reset}")
+        }
+        None => painted.to_string(),
+    }
+}
+
+/// Build the SGR 58 escape sequence for a [`Color`].
+fn underline_color_escape(color: Color) -> String {
+    match color {
+        Color::Black => "\x1b[58;5;0m".into(),
+        Color::Red => "\x1b[58;5;1m".into(),
+        Color::Green => "\x1b[58;5;2m".into(),
+        Color::Yellow => "\x1b[58;5;3m".into(),
+        Color::Blue => "\x1b[58;5;4m".into(),
+        Color::Purple | Color::Magenta => "\x1b[58;5;5m".into(),
+        Color::Cyan => "\x1b[58;5;6m".into(),
+        Color::White => "\x1b[58;5;7m".into(),
+        Color::DarkGray => "\x1b[58;5;8m".into(),
+        Color::LightRed => "\x1b[58;5;9m".into(),
+        Color::LightGreen => "\x1b[58;5;10m".into(),
+        Color::LightYellow => "\x1b[58;5;11m".into(),
+        Color::LightBlue => "\x1b[58;5;12m".into(),
+        Color::LightPurple | Color::LightMagenta => "\x1b[58;5;13m".into(),
+        Color::LightCyan => "\x1b[58;5;14m".into(),
+        Color::LightGray => "\x1b[58;5;15m".into(),
+        Color::Fixed(n) => format!("\x1b[58;5;{n}m"),
+        Color::Rgb(r, g, b) => format!("\x1b[58;2;{r};{g};{b}m"),
+        Color::Default => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod test {
     use nu_ansi_term::{Color, Style};
@@ -211,6 +316,7 @@ mod test {
         let after_style = Style::new().on(Color::Red);
         (
             super::StyledText {
+                underline_colors: vec![],
                 buffer: vec![
                     (before_style, "aaa".into()),
                     (before_style, "bbb".into()),
@@ -266,6 +372,7 @@ mod test {
     fn style_range_last_letter() {
         let (_, before_style, after_style) = get_styled_text_template();
         let mut styled_text = StyledText {
+            underline_colors: vec![],
             buffer: vec![(before_style, "asdf".into())],
         };
         styled_text.style_range(3, 4, after_style);
@@ -276,6 +383,7 @@ mod test {
     fn style_range_from_second_to_last() {
         let (_, before_style, after_style) = get_styled_text_template();
         let mut styled_text = StyledText {
+            underline_colors: vec![],
             buffer: vec![(before_style, "asdf".into())],
         };
         styled_text.style_range(2, 3, after_style);
@@ -287,6 +395,7 @@ mod test {
     fn regression_style_range_cargo_run() {
         let (_, before_style, after_style) = get_styled_text_template();
         let mut styled_text = StyledText {
+            underline_colors: vec![],
             buffer: vec![
                 (before_style, "cargo".into()),
                 (before_style, " ".into()),

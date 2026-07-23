@@ -4,6 +4,7 @@ use crate::{CursorConfig, PromptEditMode, PromptViMode};
 use {
     super::utils::{coerce_crlf, estimate_required_lines, line_width},
     crate::{
+        highlighter::Highlighter,
         menu::{Menu, ReedlineMenu},
         painting::PromptLines,
         Prompt,
@@ -519,6 +520,7 @@ impl Painter {
         menu: Option<&ReedlineMenu>,
         use_ansi_coloring: bool,
         cursor_config: &Option<CursorConfig>,
+        highlighter: Option<&dyn Highlighter>,
     ) -> Result<()> {
         // Reset any ANSI styling that may have been left by external commands
         // This ensures the prompt is not affected by previous output styling
@@ -610,9 +612,9 @@ impl Painter {
         let layout = self.compute_layout(lines, menu);
 
         if self.large_buffer {
-            self.print_large_buffer(prompt, lines, menu, use_ansi_coloring, &layout)?;
+            self.print_large_buffer(prompt, lines, menu, use_ansi_coloring, &layout, highlighter)?;
         } else {
-            self.print_small_buffer(prompt, lines, menu, use_ansi_coloring, &layout)?;
+            self.print_small_buffer(prompt, lines, menu, use_ansi_coloring, &layout, highlighter)?;
         }
 
         self.last_layout = Some(layout);
@@ -886,10 +888,12 @@ impl Painter {
         menu: &dyn Menu,
         use_ansi_coloring: bool,
         layout: &PromptLayout,
+        highlighter: Option<&dyn Highlighter>,
     ) -> Result<()> {
         let starting_row = layout.menu_start_row.unwrap_or(0);
         let remaining_lines = self.screen_height().saturating_sub(starting_row);
-        let menu_string = menu.menu_string(remaining_lines, use_ansi_coloring);
+        let menu_string =
+            menu.menu_string_with_highlighter(remaining_lines, use_ansi_coloring, highlighter);
         self.clear_from_anchor(starting_row)?;
         self.stdout
             .queue(Print(menu_string.trim_end_matches('\n')))?;
@@ -904,6 +908,7 @@ impl Painter {
         menu: Option<&ReedlineMenu>,
         use_ansi_coloring: bool,
         layout: &PromptLayout,
+        highlighter: Option<&dyn Highlighter>,
     ) -> Result<()> {
         // Emit prompt start marker (OSC 133;A;k=i for primary prompt)
         if let Some(markers) = &self.semantic_markers {
@@ -952,9 +957,16 @@ impl Painter {
             .queue(Print(&lines.after_cursor))?;
 
         if let Some(menu) = menu {
-            self.print_menu(menu, use_ansi_coloring, layout)?;
+            self.print_menu(menu, use_ansi_coloring, layout, highlighter)?;
         } else {
             self.stdout.queue(Print(&lines.hint))?;
+
+            // Print diagnostic messages below the input (only when no menu is active)
+            if !lines.diagnostic_lines.is_empty() {
+                self.stdout
+                    .queue(Print(&coerce_crlf("\n")))?
+                    .queue(Print(&lines.diagnostic_lines))?;
+            }
         }
 
         Ok(())
@@ -967,6 +979,7 @@ impl Painter {
         menu: Option<&ReedlineMenu>,
         use_ansi_coloring: bool,
         layout: &PromptLayout,
+        highlighter: Option<&dyn Highlighter>,
     ) -> Result<()> {
         let screen_width = self.screen_width();
         let screen_height = self.screen_height();
@@ -1039,7 +1052,7 @@ impl Painter {
             } else {
                 self.stdout.queue(Print(&lines.after_cursor))?;
             }
-            self.print_menu(menu, use_ansi_coloring, layout)?;
+            self.print_menu(menu, use_ansi_coloring, layout, highlighter)?;
         } else {
             // Selecting lines for the hint
             // The -1 subtraction is done because the remaining lines consider the line where the
@@ -1052,6 +1065,13 @@ impl Painter {
             // Hint lines
             let hint_skipped = skip_buffer_lines(&lines.hint, 0, Some(offset));
             self.stdout.queue(Print(hint_skipped))?;
+
+            // Print diagnostic messages below the input (only when no menu is active)
+            if !lines.diagnostic_lines.is_empty() {
+                self.stdout
+                    .queue(Print(&coerce_crlf("\n")))?
+                    .queue(Print(&lines.diagnostic_lines))?;
+            }
         }
 
         Ok(())
@@ -1481,6 +1501,7 @@ mod tests {
             after_cursor: Cow::Borrowed(after),
             hint: Cow::Borrowed(""),
             right_prompt_on_last_line: false,
+            diagnostic_lines: Cow::Borrowed(""),
         }
     }
 
@@ -1724,11 +1745,11 @@ mod tests {
         painter.set_semantic_markers(Some(Box::new(markers)));
 
         let prompt = TestPrompt;
-        let lines = PromptLines::new(&prompt, PromptEditMode::Default, None, "", "", "");
+        let lines = PromptLines::new(&prompt, PromptEditMode::Default, None, "", "", "", "");
         let layout = painter.compute_layout(&lines, None);
 
         painter
-            .print_small_buffer(&prompt, &lines, None, false, &layout)
+            .print_small_buffer(&prompt, &lines, None, false, &layout, None)
             .expect("print_small_buffer failed");
 
         let recorded = calls.lock().expect("marker lock poisoned").clone();

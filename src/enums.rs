@@ -1049,6 +1049,11 @@ pub enum ReedlineEvent {
 
     /// Change mode (vi mode only)
     ViChangeMode(String),
+
+    /// Open the diagnostic fix menu (requires lsp_diagnostics feature)
+    /// Shows available quick fixes at cursor position
+    #[cfg(feature = "lsp_diagnostics")]
+    OpenDiagnosticFixMenu,
 }
 
 pub enum EventStatus {

@@ -1,15 +1,22 @@
 mod columnar_menu;
 mod description_menu;
+#[cfg(feature = "lsp_diagnostics")]
+mod diagnostic_fix_menu;
 mod ide_menu;
 mod list_menu;
 pub mod menu_functions;
 
 use crate::core_editor::Editor;
 use crate::History;
-use crate::{completion::history::HistoryCompleter, painting::Painter, Completer, Suggestion};
+use crate::{
+    completion::history::HistoryCompleter, highlighter::Highlighter, painting::Painter, Completer,
+    Suggestion,
+};
 pub use columnar_menu::ColumnarMenu;
 pub use columnar_menu::TraversalDirection;
 pub use description_menu::DescriptionMenu;
+#[cfg(feature = "lsp_diagnostics")]
+pub use diagnostic_fix_menu::{DiagnosticFixMenu, PendingLspCommand};
 pub use ide_menu::DescriptionMode;
 pub use ide_menu::IdeMenu;
 pub use list_menu::DescriptionPosition;
@@ -145,7 +152,15 @@ pub trait Menu: Send {
     );
 
     /// Indicates how to replace in the line buffer the selected value from the menu
-    fn replace_in_buffer(&self, editor: &mut Editor);
+    fn replace_in_buffer(&mut self, editor: &mut Editor);
+
+    /// Take a pending LSP command stashed during `replace_in_buffer`, if any.
+    ///
+    /// Only `DiagnosticFixMenu` overrides this. Other menus return `None`.
+    #[cfg(feature = "lsp_diagnostics")]
+    fn take_pending_command(&mut self) -> Option<PendingLspCommand> {
+        None
+    }
 
     /// Calculates the real required lines for the menu considering how many lines
     /// wrap the terminal or if entries have multiple lines
@@ -153,6 +168,18 @@ pub trait Menu: Send {
 
     /// Creates the menu representation as a string which will be painted by the painter
     fn menu_string(&self, available_lines: u16, use_ansi_coloring: bool) -> String;
+
+    /// Creates the menu representation with optional syntax highlighting support.
+    /// Menus that support highlighting should override this method.
+    /// Default implementation falls back to menu_string().
+    fn menu_string_with_highlighter(
+        &self,
+        available_lines: u16,
+        use_ansi_coloring: bool,
+        _highlighter: Option<&dyn Highlighter>,
+    ) -> String {
+        self.menu_string(available_lines, use_ansi_coloring)
+    }
 
     /// Minimum rows that should be displayed by the menu
     fn min_rows(&self) -> u16;
@@ -461,6 +488,13 @@ impl ReedlineMenu {
             }
         }
     }
+
+    /// Take a pending LSP command from the inner menu, if it stashed one
+    /// during `replace_in_buffer`.
+    #[cfg(feature = "lsp_diagnostics")]
+    pub(crate) fn take_pending_command(&mut self) -> Option<PendingLspCommand> {
+        self.as_mut().take_pending_command()
+    }
 }
 
 impl Menu for ReedlineMenu {
@@ -542,8 +576,8 @@ impl Menu for ReedlineMenu {
         }
     }
 
-    fn replace_in_buffer(&self, editor: &mut Editor) {
-        self.as_ref().replace_in_buffer(editor);
+    fn replace_in_buffer(&mut self, editor: &mut Editor) {
+        self.as_mut().replace_in_buffer(editor);
     }
 
     fn menu_required_lines(&self, terminal_columns: u16) -> u16 {
@@ -553,6 +587,16 @@ impl Menu for ReedlineMenu {
     fn menu_string(&self, available_lines: u16, use_ansi_coloring: bool) -> String {
         self.as_ref()
             .menu_string(available_lines, use_ansi_coloring)
+    }
+
+    fn menu_string_with_highlighter(
+        &self,
+        available_lines: u16,
+        use_ansi_coloring: bool,
+        highlighter: Option<&dyn Highlighter>,
+    ) -> String {
+        self.as_ref()
+            .menu_string_with_highlighter(available_lines, use_ansi_coloring, highlighter)
     }
 
     fn min_rows(&self) -> u16 {
